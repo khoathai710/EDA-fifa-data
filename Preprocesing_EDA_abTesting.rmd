@@ -1,0 +1,1001 @@
+---
+title: Preprocessing & EDA & A/B Testing
+author: Nhóm
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(VIM)
+library(janitor)
+library(mice)
+library(stringr)
+library(knitr)
+library(DT)
+```
+
+```{r message=FALSE, warning=F}
+data <- read_csv("fifa_eda_stats.csv", na = c("", "NA"))
+data <- data |>
+  clean_names()
+```
+
+# Tiền xử lý dữ liệu
+
+## Làm sạch dữ liệu
+
+-   **Kiểm tra định dạng của dữ liệu**: Thay thế các chữ số bằng ký tự X, ta sẽ xem được định dạng của dữ liệu
+
+    ```{r}
+    currency_format <- data |> 
+      select(value, wage, release_clause, height, weight, joined, contract_valid_until) |>
+      mutate(across(everything(), ~ifelse(is.na(.), ., gsub("[0-9]+", "X", .))))
+
+    currency_format <- lapply(currency_format, unique) # Loại bỏ các định dạng trùng lặp
+    currency_format
+    ```
+
+    > ***Nhận xét***\
+    >
+    > -   Các cột `value`, `wage`, `release_clause` hiển thị các giá trị tiền tệ với đơn vị **Euro** (€) và các hậu tố **triệu** (M), **nghìn** (K)
+    > -   Cột `height` được định dạng kết hợp giữa **feet** và **inch**, trong khi cột `weight` chỉ chứa đơn vị **pound** (lbs).
+    > -   Cột `joined` chứa dữ liệu có đầy đủ thông tin về Ngày, Tháng, Năm. Ngoài ra, cột `contract_valid_until` có định dạng chỉ có thông tin về Năm
+
+-   **Xử lý dữ liệu các cột có đơn vị**:
+
+    > ***Hướng xử lý***
+    >
+    > -   Các cột dữ liệu tiền tệ (`wage`, `release_clause`, `value`) được làm sạch và chuẩn hóa về đơn vị triệu.
+    > -   Cột cân nặng (`weight`) của cầu thủ được chuyển đổi sang số nguyên sau khi xóa đơn vị **"lbs"**.
+    > -   Chiều cao (`height`) của cầu thủ được tính tổng số **inches** từ feet và inches.
+    > -   Các cột ngày (`joined`, `contract_valid_until`) được chuẩn hóa, thêm ngày cuối năm nếu chỉ có năm.
+
+    ```{r warning = FALSE}
+    # Các cột biểu diễn dữ liệu tiền tệ được xử lý băng cách bỏ ký hiệu tiền tệ, chuẩn hóa về đơn vị ở phần triệu
+    clean_currency <- function(column) {
+      column <- str_remove(column, "€") # Loại bỏ ký hiệu tiền tệ
+      # Đưa về đơn vị phần triệu
+      column <- case_when(
+        str_detect(column, "M") ~ as.numeric(str_remove(column, "M")), # Chuyển "M"
+        str_detect(column, "K") ~ as.numeric(str_remove(column, "K")) / 1e3, # Chuyển "K"
+        TRUE  ~ as.numeric(column)/1e6 # 
+        )
+      return(column)
+    }
+
+    # Cột biểu diễn cân nặng của cầu thủ được xử lý bằng cách xóa đơn vị lbs
+    clean_weight <- function(column){
+      column <- str_remove(column, "lbs")
+      column <- as.numeric(column)
+      return(column)
+    } 
+
+    # Cột biểu diễn chiều cao của cầu thủ được đưa về đơn vị inches
+    clean_height <- function(feet_inches_value){
+      parts <- str_split(string = feet_inches_value, pattern = "'")[[1]]
+      feets <- as.numeric(parts[1])
+      inches <- as.numeric(parts[2])
+      total_inches <- (feets * 12) + inches
+      return(total_inches)
+    } 
+
+    # Cột biểu diễn ngày được đưa về định dạng phù hợp. Trường hợp, các dòng chỉ có thông tin Năm ở cột contract_valid_until, ta chọn ngày cuối cùng của năm
+    clean_date <- function(date){
+      date <- ifelse(nchar(date) == 4, paste("Dec 31,", date), date)
+      date <- as.Date(date, format = "%b %d, %Y")
+      return(date)
+    }
+
+       data <- data |>
+      mutate(across(.cols = c("wage", "release_clause", "value"), ~clean_currency(.))) |>
+      mutate(wage = wage * 1000) |>
+      mutate(weight = clean_weight(weight)) |>
+      mutate(height = sapply(X = height, FUN = clean_height)) |>
+      mutate(across(.cols = c("joined", "contract_valid_until"), ~clean_date(.)))
+       
+    ```
+
+-   **Kiểm tra một số biến dạng phân loại**:
+
+    ```{r}
+    # Tổng quan các giá trị xuất hiện trong các biến phân loại
+    categorical_columns <- data |>
+      select(preferred_foot, international_reputation, position, body_type, work_rate,skill_moves, weak_foot)
+
+    lapply(categorical_columns, unique)
+    ```
+
+    ```{r}
+    # Những cầu thủ có vóc dáng là tên riêng
+    outlier_body_types <- data |>
+      select(name, body_type) |>
+      filter(!(body_type %in% c("Lean", "Normal", "Stocky", NA)))
+             
+    outlier_body_types
+    ```
+
+    > ***Nhận xét***\
+    >
+    > -   Cột `body_type`: Cột này thể hiện vóc dáng của cầu thủ với 3 giá trị là: *Lean, Normal và Stocky*. Tuy nhiên, một số giá trị bất thường như tên riêng của cầu thủ *(Messi, C. Ronaldo)* cũng xuất hiện trong cột này, khả năng cao là lỗi dữ liệu.
+    > -   Cột `work_rate`: chứa 9 giá trị khác nhau, được cấu thành từ 2 phần, phân tách bởi dấu "/". Phần đầu mô tả xu hướng hành vi của cầu thủ trong các tình huống tấn công, trong khi phần thứ hai mô tả xu hướng trong các tình huống phòng thủ. Mỗi phần có 3 cấp độ: High, Medium, Low; tạo thành 9 tổ hợp khác nhau.
+    > -   Các vị trí của cầu thủ trong đội hình được chia thành 4 nhóm chính, tổng cộng 27 vị trí:
+    >     -   **Thủ môn (Goalkeeper)**:
+    >         -   GK: Thủ môn (Goalkeeper)
+    >     -   **Hậu vệ (Defender)**:
+    >         -   LB: Hậu vệ trái (Left Back) – Bảo vệ cánh trái.
+    >         -   RB: Hậu vệ phải (Right Back) – Bảo vệ cánh phải.
+    >         -   CB: Trung vệ (Center Back) – Vị trí phòng ngự trung tâm.
+    >         -   LCB: Trung vệ lệch trái (Left Center Back) - – Trung vệ lệch về bên trái.
+    >         -   RCB: Trung vệ lệch phải (Right Center Back) - Trung vệ lệch về bên phải.
+    >         -   LWB: Hậu vệ cánh trái tấn công (Left Wing Back) – Hậu vệ cánh trái có xu hướng dâng cao
+    >         -   RWB: Hậu vệ cánh phải tấn công (Right Wing Back) – Hậu vệ cánh phải có xu hướng dâng cao.
+    >     -   **Tiền vệ (Midfielder)**:
+    >         -   CM: Tiền vệ trung tâm (Central Midfielder) – Kiểm soát khu vực trung tuyến.
+    >         -   LCM: Tiền vệ trung tâm lệch trái (Left Central Midfielder) – Tiền vệ trung tâm thiên về bên trái.
+    >         -   RCM: Tiền vệ trung tâm lệch phải (Right Central Midfielder) – Tiền vệ trung tâm thiên về bên phải.
+    >         -   CDM: Tiền vệ phòng ngự (Central Defensive Midfielder) – Tập trung phòng ngự phía trước hàng hậu vệ.
+    >         -   LDM: Tiền vệ phòng ngự lệch trái (Left Defensive Midfielder) – Phòng ngự ở bên trái trung tuyến.
+    >         -   RDM: Tiền vệ phòng ngự lệch phải (Right Defensive Midfielder) – Phòng ngự ở bên phải trung tuyến.
+    >         -   CAM: Tiền vệ tấn công (Central Attacking Midfielder) – Tập trung tấn công khu vực trung tâm.
+    >         -   LAM: Tiền vệ tấn công lệch trái (Left Attacking Midfielder) – Tấn công ở phía bên trái.
+    >         -   RAM: Tiền vệ tấn công lệch phải (Right Attacking Midfielder) – Tấn công ở phía bên phải
+    >         -   LM: Tiền vệ cánh trái (Left Midfielder) – Hỗ trợ tấn công và phòng ngự cánh trái.
+    >         -   RM: Tiền vệ cánh phải (Right Midfielder) – Hỗ trợ tấn công và phòng ngự cánh phải.
+    >     -   **Tiền đạo (Forward)**:
+    >         -   ST: Tiền đạo cắm (Striker) - Chuyên ghi bàn ở trung tâm hàng công.
+    >         -   CF: Tiền đạo trung tâm (Center Forward) – Tiền đạo chơi ngay phía trước hàng tiền vệ.
+    >         -   LS: Tiền đạo lệch trái (Left Striker) – Chuyên tấn công biên trái.
+    >         -   RS: Tiền đạo lệch phải (Right Striker) – Chuyên tấn công biên phải.
+    >         -   LW: Cánh trái (Left Winger) – Chuyên tấn công biên trái.
+    >         -   RW: Cánh phải (Right Winger) – Chuyên tấn công biên phải.
+    >         -   LF: Tiền đạo cánh trái (Left Forward) – Tiền đạo hoạt động ở phía trái.
+    >         -   RF: Tiền đạo cánh phải (Right Forward) – Tiền đạo hoạt động ở phía phải.
+
+-   **Xử lý một số biến dạng phân loại**:
+
+    > ***Hướng xử lý***
+    >
+    > -   Phân chia 27 vị trí trong cột `position` thành 4 nhóm: Goalkeeper, Defender, Midielder, Forward
+    > -   Đưa các giá trị ngoại lại trong cột `body_types` vào các nhóm chuẩn
+    > -   Phân tách cột `work_rate` thành 2 cột: `attacking_work_rate` và `deffensive_work_rate`
+    > -   Các biến phân loại được đưa về dạng `factor`
+
+    ```{r}
+    # Chuyển các vị trí vào các nhóm chính
+    position_groups <- c(
+      GK = "Goalkeeper",
+      LB = "Defender", RB = "Defender", CB = "Defender",
+      LCB = "Defender", RCB = "Defender", LWB = "Defender", RWB = "Defender",
+      CM = "Midfielder", LCM = "Midfielder", RCM = "Midfielder",
+      CDM = "Midfielder", LDM = "Midfielder", RDM = "Midfielder",
+      CAM = "Midfielder", LAM = "Midfielder", RAM = "Midfielder",
+      LM = "Midfielder", RM = "Midfielder",
+      ST = "Forward", CF = "Forward", LF = "Forward", RF = "Forward",
+      LW = "Forward", RW = "Forward", SS = "Forward",
+      LS = "Forward", RS = "Forward"
+    )
+
+    # Xử lý các giá trị ngoại lai trong cột body_type
+    clean_body_type <- function(body_type){
+      if(is.na(body_type)){
+        return(NA)
+      }
+      switch(body_type, 
+             "Messi" = "Lean", 
+             "Neymar" = "Lean", 
+             "C. Ronaldo" = "Stocky", 
+             "Courtois" = "Normal", 
+             "Shaqiri" = "Normal", 
+             "Akinfenwa" = "Stocky", 
+             "PLAYER_BODY_TYPE_25" = "Normal",
+             body_type) 
+      } 
+
+    data <- data |> 
+      mutate(position = position_groups[position]) |>
+      mutate(body_type = sapply(body_type, clean_body_type)) |>
+      separate(col = "work_rate", into = c("attacking_work_rate", "deffensive_work_rate"), sep = "/", remove = TRUE) |>
+      mutate(deffensive_work_rate = trimws(deffensive_work_rate)) |>
+      mutate(across(.cols = c("preferred_foot", "international_reputation", "position",
+                              "body_type", "attacking_work_rate", "deffensive_work_rate", 
+                              "skill_moves", "weak_foot"), ~as.factor(.)))
+    ```
+
+## Dữ liệu khuyết
+
+```{r}
+aggr(data, sortVar = T, col = c('lightblue','yellow'), number = T, cex.number = 0.75, cex.axis = 0.5 )
+```
+
+```{r}
+# Nhóm các câu lạc bộ có các cầu thủ bị khuyết dữ liệu ở cột release_clause, joined, contract_valid_until
+clubs_missing_contract <- data |> filter(!is.na(club) & is.na(loaned_from) & is.na(joined) & is.na(contract_valid_until))
+unique(clubs_missing_contract$club)
+```
+
+> **Nhận xét**\
+> - Cột `loaned_from` có dữ liệu khuyết cao nhất *(\~93.05%)*. Một nhóm các cầu thủ *(\~0.2636%)* bị khuyết các chỉ số kỹ năng.\
+> - Ngoại trừ cột `release_clause`, các cột có dữ liệu bị khuyết lớn hơn *\~0.3%* đều là **dữ liệu định tính**.\
+> - Nếu dữ liệu bị khuyết theo cơ chế **MCAR**, chúng ta sẽ kỳ vọng các mẫu dữ liệu bị khuyết xuất hiện một cách ngẫu nhiên và không có một mô hình cụ thể. Trong đồ thị này, chúng ta thấy rõ ràng có các mẫu bị khuyết cụ thể (ví dụ, nhóm biến từ *'*`preferred_foot`*'* đến ***'***`gk_reflexes`***'*** cùng nhau bị khuyết). Hơn nữa, tỷ lệ của các mẫu bị khuyết này rất khác nhau, cho thấy sự khuyết dữ liệu không phải là ngẫu nhiên hoàn toàn. Do đó, dữ liệu này có **khả năng cao không phải là MCAR**.\
+> - Với cột `loaned_from`, dữ liệu bị khuyết thuộc cơ chế **MNAR** vì thiếu sót xảy ra do bản chất dữ liệu: chỉ một phần nhỏ cầu thủ thi đấu theo dạng cho mượn. Trong nhóm cầu thủ dạng cho mượn **(nhóm A)**, ta nhận thấy các cột `release_clause` và `joined` cũng bị khuyết *(\~6.942%)*, điều này nhiều khả năng liên quan đến tính chất dữ liệu.\
+> - Một nhóm cầu thủ *(\~0.01258%)* chỉ bị khuyết ở các cột: `loaned_from`, `release_clause`, `joined`, `contract_valid_until`, và `club`. Các cột khác vẫn đầy đủ dữ liệu, do đó có thể suy đoán nhóm này thuộc về **các cầu thủ vừa hết hạn hợp đồng và chưa tìm được câu lạc bộ mới.**\
+> - Ngoài ra, có nhóm cầu thủ\* (\~0.2636%)\* có dữ liệu về câu lạc bộ nhưng lại bị khuyết ở các cột như `loaned_from`, `release_clause`, `joined`, và `contract_valid_until`.
+
+> **Hướng xử lý:**\
+> - Phần dữ liệu khuyết trong cột `loaned_from` ta sẽ thay thế bằng giá trị `Not on loan` để thể hiện các cầu thủ không ở dạng mượn.\
+> - Vì phần dữ liệu khuyết nhỏ nên ta có thể loại bỏ.
+
+```{r echo = T, results = 'hide'}
+# Xử lý dữ liệu khuyết ở cột loaned_from 
+data <- data |>
+  mutate(loaned_from = ifelse(is.na(loaned_from), "Not on loan", loaned_from)) |>
+  mutate(loaned_from = as.factor(loaned_from))
+
+# Xóa phần dữ liệu khuyết
+data <- na.omit(data)
+
+```
+
+```{r}
+# Lưu dữ liệu đã được xử lý
+write_csv(data, file = "cleaned_fifa_eda_stats.csv")
+```
+
+# EDA
+
+```{r message=FALSE}
+data <- read_csv('cleaned_fifa_eda_stats.csv')
+datatable(
+  head(data, 10), 
+  options = list(scrollX = TRUE, dom = 't')
+)
+```
+## Giá trị lớn nhất, nhỏ nhất, trung bình, trung vị, độ lệch chuẩn
+```{r}
+stats <- data |> summarise(across(c("overall", "potential", "value", "wage"),
+                                       list(gtnn = min, gtln = max, tv = median,
+                                            tb = mean, dlc = sd)))
+stats_cleaned <- stats |> gather(ten, gt) |>
+  separate(ten, into = c("bien", "tk"), sep = "_") |>
+  spread(tk, gt) |>
+  dplyr::select(bien, gtnn, gtln, tv, tb, dlc) |>  mutate(across(c(gtnn, gtln, tv, tb, dlc), ~ round(.x, 2)))
+```  
+  
+```{r}
+kable(stats_cleaned)
+```
+
+## Số câu lạc bộ và quốc gia
+```{r}
+num_clubs <- length(unique(data$club))
+num_countries <- length(unique(data$nationality))
+sprintf("Số câu lạc bộ: %d, Số quốc gia: %d", num_clubs, num_countries)
+```
+
+## Histogram cho chỉ số Overall
+
+```{r warning=FALSE}
+ggplot(data, aes(x = overall)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Phân phối chỉ số Overall", x = "Overall", y = "Số lượng cầu thủ") + 
+  geom_vline(aes(xintercept = mean(data$overall)), color = "red", linetype = "dashed", linewidth = 1) +
+  annotate(
+    "text", x = (mean(data$overall) + 1), y = 0,
+    label = paste0("Trung binh: ", round(mean(data$overall), 1)),
+    color = "red", hjust = 0.5
+  )
+```
+
+Biểu đồ cho thấy phân phối của chỉ số Overall có dạng hình chuông, tập trung chủ yếu xung quanh giá trị trung bình 66.2. Điều này cho thấy một phân phối gần giống với phân phối chuẩn
+
+## Histogram cho chỉ số Potential
+
+``` {r warning=FALSE}
+ggplot(data, aes(x = potential)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black", alpha = 1) +
+  labs(title = "Phân phối chỉ số Potential", x = "Potential", y = "Số lượng cầu thủ") +
+  geom_vline(aes(xintercept = mean(data$potential)), color = "red", linetype = "dashed", linewidth = 1) +
+  annotate(
+    "text", x = (mean(data$potential) + 1), y = 0,
+    label = paste0("Trung binh: ", round(mean(data$potential), 1)),
+    color = "red", hjust = 0.5
+  )
+```
+
+Tương tự như Overall, biều đồ cho thấy phân phối của Potential gần giống phân phối chuẩn với trung bình 71.1
+
+## Histogram cho tuổi cầu thủ
+
+``` {r warning=FALSE}
+ggplot(data, aes(x = age)) +
+  geom_histogram(binwidth = 1, fill = "lightblue", color = "black", alpha = 1) +
+  labs(title = "Phân phối tuổi cầu thủ", x = "Age", y = "Số lượng cầu thủ") +
+  geom_vline(aes(xintercept = mean(data$age)), color = "red", linetype = "dashed", linewidth = 1) +
+  annotate(
+    "text", x = (mean(data$age) + 1), y = 0,
+    label = paste0("Trung binh: ", round(mean(data$age), 1)),
+    color = "red", hjust = 0.5
+  )
+```
+
+Biểu đồ có hình dạng gần giống với phân phối chuẩn, với trung bình 25.2 tuổi. Có một số ít cầu thủ có độ tuổi lớn hơn 35, tạo nên phần đuôi bên phải của biểu đồ.
+
+## Histogram cho giá trị thị trường
+``` {r}
+data_change_value <- data |> mutate(value = value * 1000)
+ggplot(data_change_value, aes(x = value)) +
+  geom_histogram(fill = "purple", color = "black", alpha = 0.7, bins = 40) +
+  labs(title = "Phân phối giá trị thị trường (Value)", x = "Value", y = "Số lượng cầu thủ")
+```
+
+Biều đồ có sự lệch phải, cho thấy có rất nhiều cầu thủ có giá trị dưới 1 triệu euro.
+
+## Scatter plot giữa Overall và Wage
+```{r}
+ggplot(data, aes(x = overall, y = wage)) +
+  geom_point(alpha = 0.7, color = "orange") +
+  labs(title = "Mối quan hệ giữa Overall và Wage", x = "Overall", y = "Wage")
+```
+
+Các điểm dữ liệu có xu hướng tăng dần từ trái sang phải, cho thấy mối quan hệ dương giữa Overall và Wage. Nói cách khác, khi chỉ số Overall tăng lên thì mức lương cũng có xu hướng tăng theo. Tuy nhiên mối quan hệ này không hoàn toàn tuyến tính, ban đầu, khi chỉ số Overall tăng, mức lương tăng khá chậm, đến khi chỉ số Overall đạt một ngưỡng nhất định, mức lương tăng nhanh hơn.
+
+## Scatter plot giữa giá trị chuyển nhượng và chi phí giải phóng hợp đồng
+```{r}
+ggplot(data, aes(x = value, y = release_clause)) +
+  geom_point(alpha = 0.7, color = "orange") +
+  labs(title = "Mối quan hệ giữa value và release_clause", x = "value", y = "release_clause")
+```
+
+Value và release_clause có mối quan hệ gần như tuyến tính, ta cũng có thể thấy rằng release_clause thường cao hơn nhiều so với value. Điều này có thể hiểu rằng các câu lạc bộ muốn giữ chân cầu thủ của mình nên đưa ra chi phí giải phóng hợp đồng rất cao.
+
+## Các cầu thủ có Overall, Potential, Wage, Value cao nhất theo từng vị trí
+```{r}
+# Xử lý tên cầu thủ
+get_clean_name <- function(x) {
+  # Loại bỏ ký tự không hợp lệ
+  gsub("[^[:print:]]", "", x)
+}
+
+# Tìm cầu thủ có chỉ số cao nhất theo từng tiêu chí cho từng vị trí
+top_players <- data |> 
+  filter(position %in% c("Forward", "Midfielder", "Defender", "Goalkeeper")) |> 
+  group_by(position) |> 
+  summarise(
+    overall_best = get_clean_name(name[which.max(overall)]),
+    overall_value = max(overall, na.rm = TRUE),
+    potential_best = get_clean_name(name[which.max(potential)]),
+    potential_value = max(potential, na.rm = TRUE),
+    wage_best = get_clean_name(name[which.max(wage)]),
+    wage_value = max(wage, na.rm = TRUE),
+    value_best = get_clean_name(name[which.max(value)]),
+    value_value = max(value, na.rm = TRUE)
+  )
+
+kable(
+  top_players,
+  col.names = c(
+    "position", "highest_overall", "overall", 
+    "highest_potential", "potential",
+    "highest_wage", "wage",
+    "highest_value", "value"
+  ),
+  format = "pipe"
+)
+```
+
+## Giá trị trung bình của Overall và Potential theo quốc gia
+```{r}
+summary_by_country <- data |>
+  group_by(nationality) |>
+  summarise(
+    avg_overall = mean(overall),
+    avg_potential = mean(potential),
+    count = n()
+  ) |> arrange(desc(count))
+
+kable(head(summary_by_country, 10))
+```
+
+## Giá trị trung bình của Overall và Potential theo câu lạc bộ
+```{r}
+summary_by_club <- data |>
+  group_by(club) |>
+  summarise(
+    avg_overall = mean(overall),
+    avg_potential = mean(potential),
+    count = n()
+  ) |> arrange(desc(avg_overall))
+
+kable(head(summary_by_club, 10))
+```
+
+Theo bảng tổng hợp, Juventus là câu lạc bộ có chỉ số trung bình cầu thủ cũng như tiềm năng là cao nhất, những cái tên còn lại trong top 10 lần lượt là Napoli, Inter, Real Madrid, FC Barcelona, Milan, Paris Saint-German, Roma, Manchester United và Benfica. Điều đặc biệt ta có thể nhận thấy là trong top 10 có đến 5 câu lạc bộ đến từ Ý.
+
+## Số lượng cầu thủ theo vị trí
+```{r}
+position_count <- data |>
+  count(position) |> arrange(desc(n))
+
+ggplot(position_count, aes(x = reorder(position, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_text(aes(label = n), vjust = -0.5, color = "black", size = 4) +
+  labs(title = "Số lượng cầu thủ theo vị trí thi đấu",
+       x = "Vị trí thi đấu",
+       y = "Số lượng cầu thủ")
+```
+
+Số lượng tiền vệ là nhiều nhất, kế đến lần lượt là hậu vệ và tiền đạo, thủ môn là ít nhất.
+
+## Overall trung bình theo vị trí
+```{r}
+avg_overall_position <- data |>
+  group_by(position) |>
+  summarise(avg_overall = mean(overall)) |>
+  arrange(desc(avg_overall))
+
+kable(avg_overall_position)
+```
+
+Nhìn chung, chỉ số overall trung bình của các vị trí khá tương đồng, chỉ có thủ môn là thấp hơn hẳn.
+
+## Tính trung bình lương theo vị trí
+```{r}
+avg_wage_position <- data |>
+  group_by(position) |>
+  summarise(avg_wage = mean(wage)) |>
+  arrange(desc(avg_wage))
+
+# Biểu đồ
+ggplot(avg_wage_position, aes(x = reorder(position, -avg_wage), y = avg_wage)) +
+  geom_bar(stat = "identity", fill = "red", alpha = 0.7) +
+  geom_text(aes(label = round(avg_wage, 3)), vjust = -0.5, color = "black", size = 4) +
+  labs(title = "Lương trung bình theo vị trí",
+       x = "Vị trí thi đấu",
+       y = "Lương trung bình")
+```
+
+Tiền đạo có lương trung bình cao nhất, tiếp theo lần lượt là tiền vệ, hậu vệ và thủ môn
+
+## Tính trung bình các chỉ số kỹ thuật theo từng vị trí
+```{r}
+summary_position <- data |>
+  group_by(position) |>
+  summarise(across(
+    .cols = 24:56,  # Chọn các cột từ 24 đến 56
+    .fns = ~ round(mean(.x), 2)
+  ))
+datatable(
+  summary_position, 
+  options = list(scrollX = TRUE, dom = 't')
+)
+```
+
+## Tìm các chỉ số nổi bật nhất cho từng vị trí
+```{r}
+long_data <- summary_position |>
+  pivot_longer(
+    cols = -position,  # Không bao gồm cột "position"
+    names_to = "metric",  # Tên cột chứa các chỉ số
+    values_to = "mean_value"  # Tên cột chứa giá trị trung bình
+  )
+
+top_features <- long_data |>
+  group_by(position) |>
+  slice_max(order_by = mean_value, n = 5) |>  # Lấy 5 chỉ số cao nhất
+  arrange(position, desc(mean_value))  # Sắp xếp theo vị trí và giá trị
+
+kable(top_features)
+```
+
+Theo bảng tổng hợp, hậu vệ nổi bật ở các chỉ số như: sức mạnh, bật nhảy, bền bỉ, cướp bóng, quyết liệt. Tiền đạo nổi bật ở các chỉ số về: tốc độ dốc bóng, tăng tốc, nhanh nhẹn, thăng bằng, bật nhảy. Với tiền vệ, các chỉ số nổi bật là: thăng bằng, nhanh nhẹn, tăng tốc, tốc độ dốc bóng và bền bỉ, khá tương đồng với tiền đạo. Còn thủ môn thì dễ dàng thấy sự nổi bật ở các chỉ số: phản xạ, đổ người, chọn vị trí, dùng tay, phát bóng.
+
+## Thêm cột phân nhóm tuổi và trung bình các chỉ số theo nhóm tuổi
+```{r}
+data_age <- data |>
+  mutate(
+    age_group = case_when(
+      age < 23 ~ "Trẻ",
+      age >= 23 & age <= 30 ~ "Đỉnh cao",
+      age > 30 ~ "Xế chiều"
+    )
+  )
+data_age <- data_age |> relocate(age_group, .after = age)
+summary_age_group <- data_age |>
+  group_by(age_group) |>
+  summarise(
+    avg_overall = round(mean(overall), 2),
+    avg_potential = round(mean(potential), 2),
+    count = n()
+  )
+
+summary_long <- summary_age_group |>
+  pivot_longer(cols = c(avg_overall, avg_potential), names_to = "metric", values_to = "value")
+
+# Vẽ biểu đồ barplot
+ggplot(summary_long, aes(x = age_group, y = value, fill = metric)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(aes(label = round(value, 3)), position = position_dodge(width = 0.9), vjust = -0.5, color = "black", size = 4) +
+  labs(
+    title = "So sánh overall và potential giữa các nhóm tuổi", x = "Nhóm tuổi", y = "Giá trị trung bình", fill = "Chỉ số") +
+  theme_minimal()
+```
+
+Chỉ số avg_potential thường cao hơn chỉ số avg_overall ở tất cả các nhóm tuổi, ngoại trừ nhóm tuổi trẻ. Điều này gợi ý rằng tiềm năng của cầu thủ trẻ thường cao hơn so với hiệu suất thực tế của họ.
+Sự chênh lệch giữa hai chỉ số này có xu hướng giảm dần khi tuổi tăng lên. Điều này có thể cho thấy rằng khi tuổi càng cao, khả năng khai thác hết tiềm năng của bản thân càng khó khăn hơn.
+
+## Các cầu thủ trẻ tiềm năng không thi đấu cho các CLB "lớn"
+### Định nghĩa các CLB lớn
+```{r}
+big_clubs <- c("FC Barcelona", "Real Madrid", "Manchester United", "FC Bayern München", "Liverpool", 
+               "Manchester City", "Paris Saint-Germain")
+```
+
+Các câu lạc bộ lớn ở đây được định nghĩa trên cảm tính
+
+## Lọc ra cầu thủ trẻ tiềm năng không thuộc các CLB lớn
+```{r}
+young_potential_non_big_clubs <- data_age |>
+  filter(age_group == "Trẻ", potential > 85, !club %in% big_clubs)
+datatable(
+  young_potential_non_big_clubs,
+  options = list(scrollX = TRUE, scrollY = "400px", paging = FALSE, dom = 't')
+)
+```
+
+Bảng phía trên là danh sách các cầu thủ trẻ dưới 23 tuổi, có tiềm năng với chỉ số potential lớn hơn 85, quan trọng nhất là họ không thi đấu cho các câu lạc bộ lớn. Do đó các câu lạc bộ lớn có thể để mắt đến các cầu thủ này.
+
+# A/B Testing
+
+Load Sport Data Analysis đã được làm sạch
+```{r}
+data <- read_csv(file = "cleaned_fifa_eda_stats.csv")
+data <- data |> clean_names()
+```
+Thống kê đơn giản dụa trên vị trí cầu thủ
+```{r}
+data |> 
+  group_by(position) |> 
+  summarise(
+    n = n(),
+    m_wage = mean(wage, na.rm = TRUE),
+    sd_wage = sd(wage, na.rm = TRUE),
+    m_overall = mean(overall, na.rm = TRUE),
+    sd_overall = sd(overall, na.rm = TRUE),
+    m_potential = mean(potential, na.rm = TRUE),
+    sd_potential = sd(potential, na.rm = TRUE),
+    m_value = mean(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE)
+  )
+```
+
+Chạy biểu đồ so sánh phân phối về mức wage, potential, value, overrall
+```{r}
+ggplot(data, aes(x = position, y = wage, fill = position)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "POSITION", y = "WAGE") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(data, aes(x = position, y = overall, fill = position)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "POSITION", y = "OVERALL") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(data, aes(x = position, y = potential, fill = position)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "POSITION", y = "POTENTIAL") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(data, aes(x = position, y = value, fill = position)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "POSITION", y = "VALUE") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+##Nhận xét##
+Dự đoán các dự liệu cho rằng mức lương ở các vị trí đều tương đương nhau, tuy nhiên chưa rõ nên chạy Anova
+
+
+```{r}
+library(lmPerm)
+set.seed(19)
+```
+
+Anova giữa các position và 4 biến wage, overall, potential, value
+H0: Các giá trị giữa các position là như nhau
+H1: Các giả trị giữa các position là khác nhau
+```{r}
+anova_po_wage <- aovp(formula = wage~position, data = data, perm="Prob")
+summary(anova_po_wage)
+```
+
+```{r}
+anova_po_overall <- aovp(formula = overall~position, data = data, perm="Prob")
+summary(anova_po_overall)
+```
+
+```{r}
+anova_po_potential <- aovp(formula = potential~position, data = data, perm="Prob")
+summary(anova_po_potential)
+```
+
+```{r}
+anova_po_value <- aovp(formula = value~position, data = data, perm="Prob")
+summary(anova_po_value)
+```
+
+So sánh giá trị p.value, ta đưa ra kết luận (do chạy knit khá lâu nên kết quả được để ở html và báo cáo)
+
+Kiểm định độc lập các nhóm định tính trong bài với độ tin cậy là 0.05
+Biến được kiểm định ở đây là position với các biến định tính khác bao gồm: 
+- international_reputation
+- attacking_work_rate
+- deffensive_work_rate
+- body_type
+Đầu tiên là giữa position và international_reputation
+H0: Vị trí của cầu thủ không liên quan đến danh tiếng quốc tế
+H1: Vị trí của cầu thủ liên quan đến danh tiếng quốc tế
+```{r}
+repu_position <- table(data$international_reputation, data$position)
+repu_position_test <- chisq.test(repu_position)
+
+cat("\nExpected Frequencies: position and và international_reputation \n")
+repu_position_test$expected
+
+cat("Observed p-value:", repu_position_test$p.value, "\n")
+```
+Ở bảng tần số kỳ vọng ta thu được tần số kỳ vọng nhỏ hơn 5 nên kiểm định có thể không chính xác
+=> Áp dụng phương pháp lấy lại mẫu
+
+```{r,results = 'hide'}
+n_permutations <- 1000
+permutation_stats <- numeric(n_permutations)
+```
+
+```{r,results = 'hide',warning = FALSE}
+for (i in 1:n_permutations) {
+  permuted_repu <- sample(data$international_reputation)
+  permuted_table <- table(data$position, permuted_repu)
+  permuted_result <- chisq.test(permuted_table)
+  permutation_stats[i] <- permuted_result$statistic
+}
+```
+
+```{r}
+# Tính p-value
+observed_stat <- repu_position_test$statistic
+p_value_permutation <- mean(permutation_stats >= observed_stat)
+cat("p-value:", p_value_permutation, "\n")
+```
+Vậy ta bác bỏ H0 => Vị trí cầu thủ có liên quan đến danh tiếng quốc tế
+
+Kế đến ta kiểm định độc lập position vs attacking_work_rate
+Ho: Vị trí không liên quan đến attacking_work_rate
+H1: Vị trí liên quan đến attacking_work_rate
+```{r}
+# chisquare position vs attacking_work_rate
+po_attack <- table(data$attacking_work_rate, data$position)
+po_attack_test <- chisq.test(po_attack)
+cat("\nExpected Frequencies: position and ̀attacking_work_rate \n")
+po_attack_test$expected
+cat("Observed p-value:", po_attack_test$p.value, "\n")
+```
+Vậy ta bác bỏ H0 => Vị trí cầu thủ có liên quan đến attack_working_rate
+
+Ho: Vị trí không liên quan đến deffensive_work_rate
+H1: Vị trí liên quan đến deffensive_work_rate
+
+```{r}
+# chisquare position vs deffensive_work_rate
+po_defensive <- table(data$deffensive_work_rate, data$position)
+po_defensive_test <- chisq.test(po_defensive)
+cat("\nExpected Frequencies: position and deffensive_work_rate \n")
+po_defensive_test$expected
+cat("Observed p-value:", po_defensive_test$p.value, "\n")
+```
+Vậy ta bác bỏ H0 => Vị trí cầu thủ có liên quan deffensive_working_rate
+
+Ho: Vị trí không liên quan đến body_type
+H1: Vị trí liên quan đến body_type
+```{r}
+# chisquare position vs body_type
+po_body <- table(data$body_type, data$position)
+po_body_test <- chisq.test(po_body)
+cat("\nExpected Frequencies: position and body_type \n")
+po_body_test$expected
+cat("Observed p-value:", po_body_test$p.value, "\n")
+```
+Vậy ta bác bỏ H0 => Vị trí cầu thủ có liên quan đến body_type
+
+Ta kiểm thử với body_type xem có ảnh hưởng đến yếu tố tấn công hay phòng thủ không
+Ho: body_type không liên quan đến attack_work_rate
+H1: body_type liên quan đến body_type
+```{r}
+# chisquare body_type vs attacking_work_rate
+body_attack <- table(data$body_type, data$attacking_work_rate)
+body_attack_test <- chisq.test(body_attack)
+cat("\nExpected Frequencies: body_type and attacking_work_rate \n")
+body_attack_test$expected
+cat("Observed p-value:", body_attack_test$p.value, "\n")
+```
+Vậy ta bác bỏ H0 => body_type có liên quan đến attacking_work_rate
+
+Ho: body_type không liên quan đến defensive_work_rate
+H1: body_type liên quan đến defensive_work_rate
+```{r}
+# chisquare body_type vs defensive_work_rate
+body_def <- table(data$body_type, data$deffensive_work_rate)
+body_def_test <- chisq.test(body_def)
+cat("\nExpected Frequencies: body_type and deffensive_work_rate \n")
+body_def_test$expected
+cat("Observed p-value:", body_def_test$p.value, "\n")
+```
+Vậy ta bác bỏ H0 => body_type có liên quan đến deffensive_work_rate
+
+##age
+Kế đến, em muốn xem thử độ tuổi có ảnh hương đến các yếu tố khác hay không, đặc biệt là 4 yếu tố wage, potential, overall, value
+Trước hết tạo một biến mới là year_old gồm 2 giá trị là old(trên hoặc b̀ăng 30) và young(dưới 30)
+
+```{r}
+data$year_old <- ifelse(data$age >= 30, "old", "young")
+
+# Tạo hàm permutation để kiểm định
+perm_fun <- function(x, nA, nB, R) {
+  n <- nA + nB
+  mean_diff <- numeric(R)
+  for (i in 1:R){
+    idx_a <- sample(x = 1:n, size = nA)
+    idx_b <- setdiff(x = 1:n, y = idx_a)
+    mean_diff[i] <- mean(x[idx_a]) - mean(x[idx_b])
+  }
+  return(mean_diff)
+}
+
+set.seed(19)
+data |> 
+  group_by(year_old) |> 
+  summarise(
+    n = n(),
+    m_wage = mean(wage, na.rm = TRUE),
+    sd_wage = sd(wage, na.rm = TRUE),
+    m_overall = mean(overall, na.rm = TRUE),
+    sd_overall = sd(overall, na.rm = TRUE),
+    m_potential = mean(potential, na.rm = TRUE),
+    sd_potential = sd(potential, na.rm = TRUE),
+    m_value = mean(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE)
+  )
+```
+Nhín sơ qua thì nhận thấy lứa U20 có các chỉ số potential và value cao hơn lứa U30 hoặc hơn, các chỉ số wage và overall U20 thấp hơn
+Ta thực hiện kiểm định để xác định chính xác, áp dụng permutation test
+
+Với Potential và Value, độ tin cậy 0.05
+Ho: Nhóm old và young bằng nhau
+H1: Nhóm old thấp hơn nhóm young
+```{r}
+#  potential
+diff_mean_potential <- perm_fun(data$potential, nA = 3352, nB = 13291, R = 1000)
+mean_a_potential <- mean(data$potential[data$year_old == 'old'])
+mean_b_potential <- mean(data$potential[data$year_old == 'young'])
+p_value_potential <- mean(diff_mean_potential < (mean_a_potential - mean_b_potential))
+
+#  value
+diff_mean_value <- perm_fun(data$value, nA = 3352, nB = 13291, R = 1000)
+mean_a_value <- mean(data$value[data$year_old == 'old'])
+mean_b_value <- mean(data$value[data$year_old == 'young'])
+p_value_value <- mean(diff_mean_value < (mean_a_value - mean_b_value))
+
+cat("P-value for potential:", p_value_potential)
+cat("\nP-value for value:", p_value_value)
+
+```
+Như vậy ta bác bỏ H0 cho potential 
+=> Chỉ số potential của nhóm old thấp hơn nhóm young
+Như vậy ta không bác bỏ H0 cho value
+=> Chỉ số value của nhóm old và nhóm young như nhau
+
+
+Với Overall và Wage, độ tin cậy 0.05
+Ho: Nhóm old và young bằng nhau
+H1: Nhóm old cao hơn nhóm young
+
+```{r}
+# overall
+diff_mean_perm <- perm_fun(data$overall, nA = 3352, nB = 13291, R = 1000)
+mean_a <- mean(data$overall[data$year_old == 'old'])
+mean_b <- mean(data$overall[data$year_old == 'young'])
+p_value_overall <- mean(diff_mean_perm > (mean_a - mean_b))
+
+#  wage
+diff_mean_wage <- perm_fun(data$wage, nA = 3352, nB = 13291, R = 1000)
+mean_a_wage <- mean(data$wage[data$year_old == 'old'])
+mean_b_wage <- mean(data$wage[data$year_old == 'young'])
+p_value_wage <- mean(diff_mean_wage > (mean_a_wage - mean_b_wage))
+
+# p-value
+cat("P-value for overall:", p_value_potential)
+
+cat("\nP-value for wage:", p_value_wage)
+
+```
+Như vậy ta bác bỏ H0 cho overall và cả wage
+=> Chỉ số overall và wage của nhóm old cao hơn nhóm young
+
+Ngoài 4 biến trên thì ta thực hiện đồng loạt permutation test với những biến định lượng còn lại để xem giữa old và young thì sẽ có những đặc tính nào khác biệt
+H0: Đặc tính này giống nhau giữa old và young
+H1: Đặc tính này có sự khác nhau giưa old và young
+Thực hiện với độ tin cây 0.05
+```{r}
+# List of features for A/B testing
+features <- c('crossing', 'finishing', 'heading_accuracy', 'short_passing', 'volleys',
+              'dribbling', 'curve', 'fk_accuracy', 'long_passing', 'ball_control',
+              'acceleration', 'sprint_speed', 'agility', 'reactions', 'balance',
+              'shot_power', 'jumping', 'stamina', 'strength', 'long_shots',
+              'aggression', 'interceptions', 'positioning', 'vision', 'penalties',
+              'composure', 'marking', 'standing_tackle', 'sliding_tackle',
+              'gk_diving', 'gk_handling', 'gk_kicking', 'gk_positioning', 'gk_reflexes')
+
+
+# A/B testing for each feature
+
+perm_results <- data.frame(Feature = features, p_value = NA, conclusion = NA)
+
+for (feature in features) {
+  # Chia ra
+  old <- data[data$year_old == 'old', feature]
+  young <- data[data$year_old == 'young', feature]
+  # Dem phan tu
+  nnA=nrow(old)
+  nnB=nrow(young)
+  
+  diff_mean_perm <- perm_fun(data[[feature]], nA = nnA, nB = nnB, R = 1000)
+  p_value <- mean(abs(diff_mean_perm) >= abs(mean(old[[feature]]) - mean(young[[feature]])))
+  perm_results[perm_results$Feature == feature, 'p_value'] <- p_value
+  perm_results[perm_results$Feature == feature, 'conclusion'] <- ifelse(p_value < 0.05, "H1", "H0")
+}
+
+
+perm_results
+```
+Nhận xét, đa phần đều khác nhau giữa old và young trong các đặc tính, riêng ball_control thì vẫn giống nhau, như vậy ta có thể nhận xét rằng khi cần chiêu mộ một cầu thủ thì yếu tố ball_control không nằm trong xét duyệt khi phân tích giữa old và young
+
+
+Ta phân tích về các cầu thủ ở giữa các vùng
+Tạo một thuộc tính mới về các vùng của các cầu thủ, to dùng thêm tập data_continents để xác định vùng
+```{r}
+data_continents <- read_csv(file = "Countries by continents.csv")
+data_continents <- data_continents |> clean_names()
+colnames(data_continents)[colnames(data_continents) == 'country'] <- 'nationality'
+```
+```{r}
+data <- merge(data, data_continents[, c('nationality', 'continent')], by = 'nationality', all.x = TRUE)
+```
+
+```{r}
+colnames(data)[colnames(data) == 'continent'] <- 'region'
+```
+
+
+Ta thống kê cơ bản các vùng theo các biến wage,overall,potential,value
+
+```{r}
+data |> 
+  group_by(region) |> 
+  summarise(
+    n = n(),
+    m_wage = mean(wage, na.rm = TRUE),
+    sd_wage = sd(wage, na.rm = TRUE),
+    m_overall = mean(overall, na.rm = TRUE),
+    sd_overall = sd(overall, na.rm = TRUE),
+    m_potential = mean(potential, na.rm = TRUE),
+    sd_potential = sd(potential, na.rm = TRUE),
+    m_value = mean(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE)
+  )
+```
+Dù rằng ta thấy rõ có sự khác biệt rõ rệt ở biến wage và value giữa các châu lục, vấn đề này có thể liên quan đến kinh tế giữa các châu lục nên mới có sự phân biệt rõ rệt như vậy
+
+Ta dùng đồ thị để biểu diễn thử dữ liệu
+
+```{r}
+ggplot(data, aes(x = region, y = wage, fill = region)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "REGION", y = "WAGE") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+```{r}
+ggplot(data, aes(x = region, y = potential, fill = region)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "REGION", y = "POTENTIAL") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+```{r}
+ggplot(data, aes(x = region, y = overall, fill = region)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "REGION", y = "OVERALL") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+```{r}
+ggplot(data, aes(x = region, y = value, fill = region)) +
+  geom_violin(scale = "width") +  
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  labs(x = "REGION", y = "VALUE") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+Với overall và potential, để biết chắc chắn thì nên dùng anova
+Ho: overall giữa các châu lục giống nhau
+H1: overall giữa các châu lục khác nhau
+Với độ tin cậy 0.05, dưa vào p.value để đưa ra kết luận (do thời gian knit lâu nên kết luận ghi ở báo cáo)
+```{r}
+anova_re_overall <- aovp(formula = overall~region, data = data, perm="Prob")
+summary(anova_re_overall)
+```
+
+```{r}
+anova_re_potential <- aovp(formula = potential~region, data = data, perm="Prob")
+summary(anova_re_potential)
+```
+
+
+
+
+Nhóm muốn tìm hiểu ở Asia và South America tại sao lại có sự khác nhau rõ rệt như vậy, chạy permutation test ở các biến định lượng khác để xem rõ sự khác biệt và xem Asia đang có chí số ít hơn South America ở những tính chất nào
+H0: Đặc tính này giống nhau giữa South America và Asia
+H1: Đặc tính này của South America tốt hơn Asia
+Độ tin cậy là 0.05
+
+```{r}
+## So sanh giua asia va south america
+samerica_asia <- subset(data, region %in% c("South America", "Asia"))
+samerica_asia <- samerica_asia |> clean_names()
+
+
+features <- c('crossing', 'finishing', 'heading_accuracy', 'short_passing', 'volleys',
+              'dribbling', 'curve', 'fk_accuracy', 'long_passing', 'ball_control',
+              'acceleration', 'sprint_speed', 'agility', 'reactions', 'balance',
+              'shot_power', 'jumping', 'stamina', 'strength', 'long_shots',
+              'aggression', 'interceptions', 'positioning', 'vision', 'penalties',
+              'composure', 'marking', 'standing_tackle', 'sliding_tackle',
+              'gk_diving', 'gk_handling', 'gk_kicking', 'gk_positioning', 'gk_reflexes')
+
+
+# Initialize result storage
+perm_results <- data.frame(Feature = features, p_value = NA, conclusion = NA)
+
+for (feature in features) {
+  # Chia ra
+  samerica <- samerica_asia[samerica_asia$region == 'South America', feature]
+  asia <- samerica_asia[samerica_asia$region == 'Asia', feature]
+  # Dem phan tu
+  nnA=length(samerica)
+  nnB=length(asia)
+  
+  diff_mean_perm <- perm_fun(samerica_asia[[feature]], nA = nnA, nB = nnB, R = 1000)
+  p_value <- mean(diff_mean_perm >= mean(samerica) - mean(asia))
+  perm_results[perm_results$Feature == feature, 'p_value'] <- p_value
+  perm_results[perm_results$Feature == feature, 'conclusion'] <- ifelse(p_value < 0.05, "H1", "H0")
+}
+
+perm_results
+```
+Qua bảng trên ta thấy đa phần đểu H1, chỉ ra được Asia một châu lục còn chưa qua nổi trội về bóng đá đang thiếu những gì để có thể trỗi dậy mạnh hơn vươn tới South America một châu lục cực kì nổi trội
+
+

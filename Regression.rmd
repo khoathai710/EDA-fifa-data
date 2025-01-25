@@ -1,0 +1,1534 @@
+---
+title: "Linear Regression"
+author: "Nhóm 19"
+date: "01-12-2024"
+output: html_document
+---
+
+
+# Thư viện
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(janitor)
+library(stringr)
+library(stats)
+library(boot)
+library(caret)
+library(leaps)
+library(glmnet)
+library(Metrics)
+library(car)
+library(visreg)
+library(corrplot)
+library(lmPerm)
+library(dplyr)
+library(mgcv)
+```
+
+# Đọc và xử lí dữ liệu
+
+```{r}
+data <- read.csv("cleaned_fifa_eda_stats.csv")
+head(data)
+```
+
+Ta loại bỏ các cột không đóng góp giá trị như id, name, nationality, loan_from, club
+
+\- id, name: do là các giá trị riêng biệt
+
+\- club : do các biến này có thể đóng góp trong thực tế (ví dụ như cầu thủ của Real Madrid thì tiềm năng hơn) tuy nhiên ta sẽ loại bỏ nó vì có quá nhiều câu lạc bộ sẽ làm tăng quá nhiều độ phức tạp của mô hình, tương tự với 'nationality' và 'loan_from'.
+
+```{r}
+data <- data|> dplyr::select(-c(id,name))
+
+data <- data |> dplyr::select(-c(loaned_from,club,nationality))
+```
+
+## Xử lí dữ liệu:
+
+\- Ta chỉnh các biến định tính về dạng 'factor'
+
+\- Các biến có dạng mm-dd-yyyy thì ta chỉ giữ lại năm (yyyy).
+
+```{r}
+data_numeric <- data |> dplyr::select(where(is.numeric))
+
+all_colname <- names(data)
+
+category_col <- setdiff(all_colname, names(data_numeric))
+
+for (i in 1:length(category_col)) {
+  data <- data |>
+    mutate(across(all_of(category_col[i]), as.factor))
+}
+
+data$contract_valid_until <- as.numeric(substr(data$contract_valid_until, 1, 4))
+data$joined <- as.numeric(substr(data$joined, 1, 4))
+
+```
+
+## Tách dữ liệu làm hai tập train test
+
+```{r}
+set.seed(100)
+id_train <- sample(1:nrow(data),size = as.integer(0.8* nrow(data)))
+id_test <- setdiff(1:nrow(data), id_train)
+data_train <- data[id_train,]
+data_test <- data[id_test,]
+```
+
+# I. Linear Regression cho Overall
+
+# 1. Mô hình hồi quy với tất cả các biến
+
+```{r}
+model <- lm(formula = overall ~ ., data = data_train)
+```
+
+```{r}
+result_display <- function(model, data_test, target){
+  
+  # Phần dư và các chỉ số trên tập huấn luyện
+  residuals_train <- residuals(model)
+  mae_train <- mean(abs(residuals_train))
+  mse_train <- mean(residuals_train^2)
+  adjr2_train <- summary(model)$adj.r.squared
+  
+  # Dự đoán trên tập kiểm tra
+  y_predict <- predict(model, newdata = data_test)
+  
+  # Tính các chỉ số trên tập kiểm tra
+  mse_test <- mean((data_test[[target]] - y_predict)^2)
+  mae_test <- mean(abs(data_test[[target]] - y_predict))
+
+  SSE <- sum((data_test[[target]] - y_predict)^2)
+  SST <- sum((data_test[[target]] - mean(data_test[[target]]))^2)  
+  
+  r_squared_test <- 1 - (SSE / SST)
+
+  n_test <- length(data_test[[target]])  # số mẫu trong tập kiểm tra
+  k <- length(model$coefficients) - 1    # số tham số trong mô hình (không tính hằng số)
+  
+  adj_r_squared_test <- 1 - ((1 - r_squared_test) * (n_test - 1) / (n_test - k - 1))
+  
+  # Tạo bảng kết quả
+  results <- data.frame(
+    Metric = c("MSE", "MAE", "Adjusted R2"),
+    Train = c(mse_train, mae_train, adjr2_train),
+    Test = c(mse_test, mae_test, adj_r_squared_test)
+  )
+  
+  return(results)
+}
+
+```
+
+```{r}
+result_display(model,data_test,'overall')
+```
+
+## 2. Lựa chọn mô hình
+
+### 2.1 Step_wise với kFolds Cross-Validaiton
+
+```{r}
+library(leaps)
+set.seed(100)
+k = 5 
+folds<-sample(rep(1:k,length=nrow(data_train)))
+```
+
+```{r}
+ predict.regsubsets <- function(object, newdata, id_model){
+   form <- as.formula(object$call[[2]])
+   x_mat <- model.matrix(form, newdata)
+   coef_est <- coef(object, id = id_model)
+   x_vars <- names(coef_est)
+   res <- x_mat[, x_vars] %*% coef_est
+   return(as.numeric(res))
+ }
+```
+
+Ta sẽ dùng phương pháp là 'backward' để giảm thiểu thời gian cho việc chọn biến vì nếu như dùng 'exhaustive' cho quá nhiều biến thì rất tốn thời gian và thậm chí không tìm ra.
+
+```{r}
+cv_error_fifa_rj<-matrix(0,nrow=k,ncol=dim(data_train)[2])
+for (r in 1: k){
+  train <- data_train[folds !=r,]
+  validation <- data_train[folds ==r,]
+  out_subset_fifa_folds<-regsubsets(x=overall~ .,data=train,method="backward",nvmax=dim(train)[2])
+   for(j in 1:dim(train)[2]){
+     pred_rj<-predict(out_subset_fifa_folds, newdata=validation,id_model=j)
+     cv_error_fifa_rj[r,j]<-(mean((validation$overall-pred_rj)^2))
+ }
+}
+ cv_error_fifa<-colMeans(cv_error_fifa_rj)
+```
+
+```{r}
+ggplot(data= data.frame(x= c(1:dim(data_train)[2]),y=cv_error_fifa),aes(x=x,y=y)) +
+ geom_point() +
+ geom_line()+
+ labs(x="Number of predictors",y="RMSE") +
+ theme_bw()
+```
+```{r}
+cv_error_fifa
+```
+
+Dưới đây là mô hình tốt nhất được lựa chọn từ phương pháp này
+
+```{r}
+out_subset_fifa_2 <- regsubsets(x = overall ~ ., data = data_train,method = "backward",nvmax = dim(train)[2])
+a <- names(coef(out_subset_fifa_2, id = which.min(cv_error_fifa)))
+```
+
+
+```{r}
+data_train_subset <- data_train|> dplyr::select(-c(wage,preferred_foot,weak_foot,attacking_work_rate,deffensive_work_rate,body_type,position,joined,height,dribbling,curve,fk_accuracy,long_passing,jumping,long_shots,interceptions))
+```
+
+Ta thấy các thông số đo lường tuy có giảm nhưng không quá đáng kể, nhưng ta đã giảm được độ phức tạp của thuật toán khá nhiều khi bỏ đi một số các biến đầu vào.
+
+```{r}
+model <- lm(formula = overall ~ ., data = data_train_subset)
+result_display(model,data_test,'overall')
+```
+
+### 2.2 Ridge và Lasso
+
+```{r}
+x <- model.matrix(overall ~ ., data = data_train)[,-1]
+y <- data_train$overall
+```
+
+```{r}
+library(glmnet)
+
+```
+
+```{r}
+out_cv_lasso <- cv.glmnet(x = x, y = y, alpha = 1, type.measure = "mse", nfolds = 5,family = "gaussian")
+lambda_grid <- 10^seq(from = 10, to =-2, length = 100)
+
+beta_lambda_lasso <- out_cv_lasso$lambda.min
+out_lasso_md <- glmnet(x = x, y = y, alpha = 1,lambda = lambda_grid, family = "gaussian")
+predict(out_lasso_md, s = beta_lambda_lasso, type = "coefficients")
+```
+
+#### Cross-Validation cho mô hình đã bỏ đi các biến theo Lasso
+
+```{r}
+data_train_lasso <- data_train|>dplyr::select(-c(release_clause,interceptions,long_shots,curve,fk_accuracy,volleys,weight,attacking_work_rate,wage,preferred_foot))
+
+mse_list <- c()
+
+# kfolds = 5
+for (i in 1: 5){
+  train <- data_train_lasso[folds != i,]
+  validate <- data_train_lasso[folds == i,]
+  
+  fifa_lasso <- lm(formula = overall ~.,data = train)
+  
+  mse <- (mean((validate$overall-predict(newdata = validate,fifa_lasso))^2))
+  mse_list <- c(mse_list,mse)
+}
+```
+
+```{r}
+mse_cv <- mean(mse_list)
+cat("RMSE: ",mse_cv)
+```
+
+Các thông số bằng phương pháp này cho kết quả tốt hơn so với phương pháp trước nên vì thế ta sẽ dùng mô hình này cho các bước tiếp theo.
+
+```{r}
+data_train_lasso <- data_train|>dplyr::select(-c(release_clause,interceptions,long_shots,curve,fk_accuracy,volleys,weight,attacking_work_rate,wage,preferred_foot))
+
+model <-lm(formula = overall ~.,data = data_train_lasso)
+
+result_display(model,data_test,'overall')
+```
+
+## 3. Chuẩn đoán mô hình
+
+### 3.1 Kiểm tra tính tuyến tính của mô hình
+
+```{r}
+model <- lm(data = data_train_lasso, formula = overall ~. )
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(model,aes(x = .fitted, y = .resid))+
+  geom_point()+
+  geom_smooth(method = 'loess',se = F)+
+  geom_hline(yintercept = 0,linetype = 'dashed')+
+  theme_bw()+
+  labs(x = "Fitted values", y = "Residuals")
+```
+
+Ta thấy dựa vào hình thì giá trị thặng dư khá tốt ở lúc đầu tuy nhiên phần cuối lại có dấu hiệu là đường cong nên vì thế ta sẽ hiệu chỉnh sau.
+
+### 3.2 Kiểm tra tính tuyến tính từng phần
+
+```{r}
+terms_md <- predict(model, type = "terms")
+partial_resid_md <- residuals(model, type = "partial")
+
+col = names(data.frame(terms_md))
+
+# Duyệt qua tất cả các cột trong data và vẽ biểu đồ cho từng cột
+for (i in 1:length(col)){
+
+  # Tạo dataframe cho mỗi cột
+  data_part_resid_md <- tibble(
+  data_ = data_train[, col[i]],
+  terms = terms_md[, col[i]],
+  partial_resid = partial_resid_md[, col[i]]
+  )
+  
+  # Vẽ biểu đồ và hiển thị biểu đồ cho từng cột
+  p <- ggplot(data_part_resid_md, mapping = aes(data_, partial_resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "forestgreen") +
+  geom_line(aes(x = data_, y = terms), color = "blue") +
+  labs(x = col[i], y = "Partial Residuals") +
+  theme_bw()
+
+# In ra biểu đồ
+  print(p)
+}
+```
+
+### 3.3 Kiểm tra đồng nhất phương sai
+
+```{r}
+ggplot(model, aes(.fitted, sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", na.rm = TRUE, se = FALSE) +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+Từ hình ảnh ta thấy các điểm đầu khá chuẩn chỉ có những điểm dữ lệu cuối có xu hướng đường cong rõ rệt tương tự như phần 3.1
+
+
+### 3.4 Kiểm tra điểm ngoại lai
+
+```{r}
+ggplot(model, aes(.hat, .stdresid)) +
+ geom_point(aes(size = .cooksd)) +
+ xlab("Leverage") + ylab("Standardized Residuals") +
+ scale_size_continuous("Cook's Distance", range = c(1, 6)) +
+ theme_bw() +
+ theme(legend.position = "bottom")
+```
+
+```{r}
+std_resid_md <- rstandard(model)
+hat_values_md <- hatvalues(model)
+cooks_D_md <- cooks.distance(model)
+
+```
+
+```{r}
+ data_cooks_md <- tibble(id_point = 1:nrow(data_train_lasso),
+ rstand = std_resid_md, hats = hat_values_md,
+ cooks = cooks_D_md, overall = data_train_lasso$overall)
+ data_cooks_md <- data_cooks_md |> arrange(desc(cooks))
+ head(data_cooks_md)
+```
+
+Ta sẽ thực hiện loại bỏ Outlier cho mô hình
+
+Những điểm nào có cook distance lớn hơn 4/n với n là tổng số quan sát thì ta sẽ loại bỏ những điểm này
+
+```{r}
+id_exclude <- (data_cooks_md |> filter(cooks > 4/nrow(data_train_lasso)))$id_point
+id_rest <- setdiff(data_cooks_md$id_point,id_exclude)
+data_train_lasso <- data_train_lasso[id_rest,]
+```
+
+```{r}
+model <- lm(data = data_train_lasso, formula = overall ~. )
+
+
+result_display(model,data_test,'overall')
+```
+
+Ta thấy mô hình cho kết quả tốt hơn ở tập train so với ban đầu. Vì các điểm Outlier đã bị loại bỏ giúp cho mô hình học tốt hơn. Tuy nhiên ở tập test đã tăng lên. Ta sẽ giải quyết vấn đề này ở phần 3
+
+### 3.5 Kiểm tra đa cộng tuyến
+
+```{r}
+model <- lm(data = data_train_lasso, formula = overall ~. )
+library(car)
+df_vif <- data.frame(vif(model))|>arrange(desc(GVIF)) |>filter(GVIF >5)
+
+df_vif
+```
+
+```{r}
+remove_multicollinearity <- function(feature, data_train) {
+  return (data_train |> dplyr::select(-all_of(feature)))
+}
+```
+
+```{r}
+while(TRUE){
+  model <- lm(data = data_train_lasso, formula = overall ~. )
+  
+  df_vif <- data.frame(vif(model))|>arrange(desc(GVIF)) |>filter(GVIF >5)|>slice_max(GVIF, n = 1)
+  vec_feature <- row.names(df_vif)
+  
+  
+  if (length(vec_feature) == 0){
+    break
+  }
+  
+  data_train_lasso <- remove_multicollinearity(vec_feature,data_train_lasso)
+}
+```
+
+```{r}
+model <- lm(data = data_train_lasso, formula = overall ~. )
+
+
+result_display(model,data_test,'overall')
+
+```
+
+Sau khi loại bỏ hết đa cộng tuyến thì mô hình trở nên rất tê, tuy nhiên nó đã giảm được độ phức tạp cuẩ thuật toán khá nhiều
+
+## 4. Mở rộng mô hình
+
+```{r}
+upgrade_model <- lm(formula = overall ~ poly(age,4)+poly(value,2) +poly(potential,2)+., data = data_train_lasso)
+
+result_display(upgrade_model,data_test,'overall')
+```
+
+Ta sẽ sử dụng hàm mũ cho các biến như 'age', 'value', 'potential' ta thấy mô hình đã cải thiện rõ rệt và cho thông số rất tốt.
+
+```{r}
+data_tst <- data_test|>dplyr::select(names(data_train_lasso))
+new_obs <- data_tst[10,]
+new_obs
+```
+
+## 5. Xây dựng khoảng tin cậy
+
+
+### 5.1 Xay dựng khoảng tin cậy cho từng biến
+
+```{r}
+fun_boot_md <- function(data, ind, formula, ...){
+ data_new <- data[ind,]
+ out_md <- lm(formula = formula, data = data_new, ...)
+ return(out_md$coefficients)
+}
+set.seed(100)
+
+out_boot_md <- boot(data = data_train_lasso, statistic = fun_boot_md, R = 1000,
+ formula = overall ~ poly(age,4)+ poly(value,2)+ poly(potential,2)+ .,parallel = "multicore")
+
+```
+```{r}
+pvals <- sapply(1:ncol(out_boot_md$t),function(x) {
+ qt0 <- mean(out_boot_md$t[, x] <= 0)
+ if (!is.na(qt0)){
+   if (qt0 < 0.5) {
+   return(2*qt0)
+   } else {
+   return(2*(1- qt0))
+   }
+ }
+ }
+ )
+pvals <- unlist(pvals)
+
+
+cat(pvals, sep = " ")
+
+```
+Bên trên và p_value cho từng biến
+
+
+### 5.2 Khoảng tin cậy cho trung bình
+```{r}
+fun_model_predict_mu <- function(data,ind,formula,new_observation){
+  data_new <- data[ind,]
+  model <- lm(formula = formula,data = data_new)
+  pred <- predict(model,newdata = new_observation)
+  return (pred)
+}
+```
+```{r}
+library(boot)
+set.seed(100)
+
+out_boot_pred <- boot(data = data_train_lasso, statistic = fun_model_predict_mu,formula = overall ~ poly(age,4)+ poly(value,2)+ poly(potential,2)+.,new_observation = new_obs, R = 1000, parallel = "multicore")
+
+```
+
+```{r}
+df <- data.frame(t = out_boot_pred$t)
+
+# Create the histogram using ggplot
+ggplot(df, aes(x = t)) +
+  geom_histogram(binwidth = 0.2, fill = "lightblue", color = "black") +
+  labs(x = "Bootstrap Estimates", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+quantile(out_boot_pred$t,c(0.025,0.975))
+```
+
+### 5.3 Khoảng tin cậy cho biến dự đoán
+
+```{r}
+ resid <- residuals(upgrade_model)
+ y_pd_pci <- out_boot_pred$t + sample(resid, size = 1000, replace = TRUE)
+ quantile(y_pd_pci, probs = c(0.025, 0.975))
+```
+
+# II. Linear Regression cho Potential
+## 1. Mô hình hồi quy với tất cả các biến
+
+```{r}
+model <- lm(formula = potential ~ ., data = data_train)
+
+```
+
+```{r}
+result_display(model,data_test,'potential')
+```
+
+## 2. Lựa chọn mô hình
+
+### 2.1 Step_wise và kFolds Cross-Validaiton
+
+```{r}
+library(leaps)
+set.seed(101)
+k = 5 
+folds<-sample(rep(1:k,length=nrow(data_train)))
+```
+
+```{r}
+ predict.regsubsets <- function(object, newdata, id_model){
+   form <- as.formula(object$call[[2]])
+   x_mat <- model.matrix(form, newdata)
+   coef_est <- coef(object, id = id_model)
+   x_vars <- names(coef_est)
+   res <- x_mat[, x_vars] %*% coef_est
+   return(as.numeric(res))
+ }
+```
+
+```{r}
+cv_error_fifa_rj<-matrix(0,nrow=k,ncol=dim(data_train)[2])
+for (r in 1: k){
+  train <- data_train[folds !=r,]
+  validation <- data_train[folds ==r,]
+  out_subset_fifa_folds<-regsubsets(x=potential~ .,data=train,method="backward",nvmax=dim(train)[2])
+   for(j in 1:dim(train)[2]){
+     pred_rj<-predict(out_subset_fifa_folds, newdata=validation,id_model=j)
+     cv_error_fifa_rj[r,j]<-(mean((validation$potential-pred_rj)^2))
+ }
+}
+ cv_error_fifa<-colMeans(cv_error_fifa_rj)
+```
+
+```{r}
+ggplot(data= data.frame(x= c(1:dim(data_train)[2]),y=cv_error_fifa),aes(x=x,y=y)) +
+ geom_point() +
+ geom_line()+
+ labs(x="Number of predictors",y="RMSE") +
+ theme_bw()
+```
+
+```{r}
+out_subset_fifa_2 <- regsubsets(x = potential ~ ., data = data_train,method = "backward",nvmax = dim(data_train)[2])
+a <- names(coef(out_subset_fifa_2, id = which.min(cv_error_fifa)))
+```
+
+```{r}
+setdiff(names(data_train),a)
+```
+
+```{r}
+data_train_subset <- data_train|> dplyr::select(-c(
+  wage, preferred_foot, skill_moves, attacking_work_rate, 
+  deffensive_work_rate, body_type, position, weight, heading_accuracy, 
+  dribbling, curve, fk_accuracy, reactions, shot_power, jumping, 
+  interceptions, gk_kicking)
+)
+```
+
+```{r}
+model <- lm(formula = potential ~ ., data = data_train_subset)
+result_display(model,data_test,'potential')
+```
+
+### 2.2 Ridge và Lasso
+
+```{r}
+x <- model.matrix(potential ~ ., data = data_train)[,-1]
+y <- data_train$potential
+```
+
+```{r}
+library(glmnet)
+```
+
+```{r}
+out_cv_lasso <- cv.glmnet(x = x, y = y, alpha = 1, type.measure = "mse", nfolds = 5,family = "gaussian")
+lambda_grid <- 10^seq(from = 10, to =-2, length = 100)
+
+beta_lambda_lasso <- out_cv_lasso$lambda.min
+out_lasso_md <- glmnet(x = x, y = y, alpha = 1,lambda = lambda_grid, family = "gaussian")
+predict(out_lasso_md, s = beta_lambda_lasso, type = "coefficients")
+```
+
+#### Cross- Validation cho Lasso Model
+
+```{r}
+data_train_lasso <- data_train|>dplyr::select(-c(release_clause,gk_reflexes,gk_kicking,gk_handling,gk_diving,sliding_tackle,interceptions,shot_power,reactions,ball_control,long_passing,fk_accuracy,curve,dribbling,short_passing,finishing,skill_moves,wage))
+
+mse_list <- c()
+
+# kfolds = 5
+for (i in 1: 5){
+  train <- data_train_lasso[folds != i,]
+  validate <- data_train_lasso[folds == i,]
+  
+  fifa_lasso <- lm(formula = potential ~.,data = train)
+  
+  mse <- (mean((validate$potential-predict(newdata = validate,fifa_lasso))^2))
+  mse_list <- c(mse_list,mse)
+}
+```
+
+```{r}
+mse_cv <- mean(mse_list)
+cat("RMSE: ",mse_cv)
+```
+
+```{r}
+model <-lm(formula = potential ~.,data = data_train_lasso)
+
+result_display(model,data_test,'potential')
+```
+
+Ta chọn bộ data 'data_train_subset' cho những phần tiếp theo.
+
+## 3. Chuẩn đoán mô hình
+
+### 3.1 Kiểm tra tính tuyến tính của mô hình
+
+```{r}
+model <- lm(data = data_train_subset, formula = potential ~. )
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(model,aes(x = .fitted, y = .resid))+
+  geom_point()+
+  geom_smooth(method = 'loess',se = F)+
+  geom_hline(yintercept = 0,linetype = 'dashed')+
+  theme_bw()+
+  labs(x = "Fitted values", y = "Residuals")
+```
+
+Tính tuyến tính của mô hình là không thỏa chủ yếu ở những điểm đầu và cuối.
+
+### 3.2 Kiểm tra tính tuyến tính từng phần
+
+```{r}
+terms_md <- predict(model, type = "terms")
+partial_resid_md <- residuals(model, type = "partial")
+
+col = names(data.frame(terms_md))
+
+# Duyệt qua tất cả các cột trong data và vẽ biểu đồ cho từng cột
+for (i in 1:length(col)){
+
+  # Tạo dataframe cho mỗi cột
+  data_part_resid_md <- tibble(
+  data_ = data_train[, col[i]],
+  terms = terms_md[, col[i]],
+  partial_resid = partial_resid_md[, col[i]]
+  )
+  
+  # Vẽ biểu đồ và hiển thị biểu đồ cho từng cột
+  p <- ggplot(data_part_resid_md, mapping = aes(data_, partial_resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "forestgreen") +
+  geom_line(aes(x = data_, y = terms), color = "blue") +
+  labs(x = col[i], y = "Partial Residuals") +
+  theme_bw()
+
+# In ra biểu đồ
+  print(p)
+}
+```
+
+### 3.3 Kiểm tra đồng nhất phương sai
+
+```{r}
+ggplot(model, aes(.fitted, sqrt(abs(.stdresid)))) +
+  geom_point(na.rm = TRUE) +
+  geom_smooth(method = "loess", na.rm = TRUE, se = FALSE) +
+  labs(x = "Fitted Values", y = expression(sqrt("|Standardized residuals|"))) +
+  theme_bw()
+```
+
+Mô hình không đồng nhất phương sai
+
+
+### 3.4 Kiểm tra điểm ngoại lai
+
+```{r}
+ggplot(model, aes(.hat, .stdresid)) +
+ geom_point(aes(size = .cooksd)) +
+ xlab("Leverage") + ylab("Standardized Residuals") +
+ scale_size_continuous("Cook's Distance", range = c(1, 6)) +
+ theme_bw() +
+ theme(legend.position = "bottom")
+```
+
+```{r}
+std_resid_md <- rstandard(model)
+hat_values_md <- hatvalues(model)
+cooks_D_md <- cooks.distance(model)
+
+```
+
+Ta sẽ thực hiện loại bỏ Outlier cho mô hình
+
+Những điểm nào có cook distance lớn hơn 4/n với n là tổng số quan sát thì ta sẽ loại bỏ những điểm này
+
+```{r}
+ data_cooks_md <- tibble(id_point = 1:nrow(data_train_subset),
+ rstand = std_resid_md, hats = hat_values_md,
+ cooks = cooks_D_md)
+ data_cooks_md <- data_cooks_md |> arrange(desc(cooks))
+ head(data_cooks_md)
+```
+
+```{r}
+id_exclude <- (data_cooks_md |> filter(cooks > 4/nrow(data_train_subset)))$id_point
+```
+
+```{r}
+id_rest <- setdiff(data_cooks_md$id_point,id_exclude)
+```
+
+```{r}
+data_train_subset <- data_train_subset[id_rest,]
+```
+
+```{r}
+model <- lm(data = data_train_subset, formula = potential ~. )
+
+result_display(model,data_test,'potential')
+
+```
+
+Ta thấy mô hình cho kết quả tốt hơn ở tập train so với ban đầu. Vì các điểm Outlier đã bị loại bỏ giúp cho mô hình học tốt hơn. Tuy nhiên ở tập test đã tăng lên. Ta sẽ giải quyết vấn đề này ở phần 3
+
+### 3.5 Kiểm tra đa cộng tuyến
+
+```{r}
+model <- lm(data = data_train_subset, formula = potential ~. )
+library(car)
+data.frame(vif = vif(model))|>arrange(desc(vif))
+```
+
+```{r}
+while(TRUE){
+  model <- lm(data = data_train_subset, formula = potential ~. )
+  
+  df_vif <- data.frame(vif = vif(model))|>arrange(desc(vif))|>filter(vif >5)|>slice_max(vif, n = 1)
+  vec_feature <- row.names(df_vif)
+  
+ 
+  if (length(vec_feature) == 0){
+    break
+  }
+ 
+  data_train_subset<- remove_multicollinearity(vec_feature,data_train_subset)
+}
+```
+
+```{r}
+model <- lm(data = data_train_subset, formula = potential ~. )
+result_display(model,data_test,'potential')
+```
+
+## 4. Mở rộng mô hình
+
+```{r}
+upgrade_model <- lm(formula = potential ~ poly(age,4)+., data = data_train_subset)
+
+result_display(upgrade_model,data_test,'potential')
+```
+
+```{r}
+summary <- summary(upgrade_model)
+cat("Adjusted R2 train:",summary$adj.r.squared)
+```
+
+```{r}
+data_tst <- data_test|>dplyr::select(names(data_train_subset))
+new_obs <- data_tst[4,]
+new_obs
+```
+
+## 5. Xây dựng khoảng tin cậy
+
+### 5.1 Xay dựng khoảng tin cậy cho từng biến
+
+```{r}
+fun_boot_md <- function(data, ind, formula, ...){
+ data_new <- data[ind,]
+ out_md <- lm(formula = formula, data = data_new, ...)
+ return(out_md$coefficients)
+}
+set.seed(100)
+
+out_boot_md <- boot(data = data_train_subset, statistic = fun_boot_md, R = 1000,
+ formula = potential ~ poly(age,4)+ .,parallel = "multicore")
+
+```
+```{r}
+pvals <- sapply(1:ncol(out_boot_md$t),function(x) {
+ qt0 <- mean(out_boot_md$t[, x] <= 0)
+ if (!is.na(qt0)){
+   if (qt0 < 0.5) {
+   return(2*qt0)
+   } else {
+   return(2*(1- qt0))
+   }
+ }
+ }
+ )
+pvals <- unlist(pvals)
+
+
+cat(pvals, sep = " ")
+
+```
+### 5.2 Khoảng tin cậy cho trung bình
+
+```{r}
+fun_model_predict_mu <- function(data,ind,formula,new_observation,knot){
+  data_new <- data[ind,]
+  model <- lm(formula = formula,data = data_new)
+  pred <- predict(model,newdata = new_observation)
+  return (pred)
+}
+```
+
+```{r}
+library(boot)
+set.seed(100)
+
+out_boot_pred <- boot(data = data_train_subset, statistic = fun_model_predict_mu,formula =
+                       potential ~ poly(age,4)+.,new_observation = new_obs, R = 1000, parallel = "multicore")
+
+```
+
+```{r}
+df <- data.frame(t = out_boot_pred$t)
+
+# Create the histogram using ggplot
+ggplot(df, aes(x = t)) +
+  geom_histogram(binwidth = 0.02, fill = "lightblue", color = "black") +
+  
+  labs(x = "Bootstrap Estimates", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+quantile(out_boot_pred$t,c(0.025,0.975))
+```
+
+### 5.3 Khoảng tin cậy cho biến dự đoán
+
+```{r}
+ resid <- residuals(upgrade_model)
+ y_pd_pci <- out_boot_pred$t + sample(resid, size = 1000, replace = TRUE)
+ quantile(y_pd_pci, probs = c(0.025, 0.975))
+```
+
+
+# III. Linear Regresion cho Value
+
+```{r}
+
+simplified_data <- data|> dplyr::mutate(wage = wage * 1000)
+```
+
+
+```{r message=FALSE}
+value_lm <- lm(value ~ ., data = simplified_data)
+
+summary(value_lm)
+```
+
+> **Nhận xét**
+>
+> -   Dựa trên kết quả từ hàm summary, ta nhận thấy được độ chính xác của mô hình rất cao R-squared: 0.9901, Adjusted R-squared: 0.9901.
+> -   Với mức ý nghĩa alpha = 0.0001 và kết quả từ cột Pr(\>\|t\|), các biến giải thích có ảnh hưởng đáng kể đến mô hình bao gồm: age, overall, potential, wage, international_reputation, positionalGoalKeeper, crossing, finishing, volleys, fk_accuracy, stamina, gk_kicking, release_clause. Tuy nhiên, cần lưu ý rằng các giá trị p-value này dựa trên các giả định của mô hình hồi quy tuyến tính.
+> -   Để đảm bảo tính chính xác và độ tin cậy của các hệ số ước lượng, nên áp dụng phương pháp bootstrap để kiểm định các hệ số thay vì chỉ dựa vào giả định ban đầu của mô hình.
+
+## 1. Sự suy luận cho mô hình
+
+-   Vì dữ liệu có kích thước rất lớn, thời gian thực hiện Boostrap sẽ rất lâu, nên ta thiết lập tham số `parallel = multicore` để thực hiện song song.
+
+```{r}
+# Thực hiện phương pháp boostrap
+fun_boot_md <- function(data, ind, formula, ...){
+  data_new <- data[ind,]
+  out_md <- lm(formula = formula, data = data_new, ...)
+  return(setNames(out_md$coefficients, names(out_md$coefficients)))
+}
+
+set.seed(84)
+boot_value_lm <- boot(data = simplified_data, statistic = fun_boot_md, R = 1000, formula = value ~ ., parallel = "multicore")
+```
+
+### 1.1 Kiểm định hệ số bằng phương pháp Bootstrap
+
+```{r}
+pvals_boot_value <- sapply(1:ncol(boot_value_lm$t),function(x) {
+  qt0 <- mean(boot_value_lm$t[, x] <= 0)
+  if (qt0 < 0.5) {
+    return(2*qt0)
+  } else {
+    return(2*(1- qt0))
+  }
+})
+names(pvals_boot_value) <-  names(boot_value_lm$t0)
+pvals_boot_value[pvals_boot_value < 0.0001]
+```
+
+> **Nhận xét**
+>
+> -   Với mức ý nghĩa alpha = 0.0001 các biến giải thích có ý nghĩa thống kê đối với mô hình bao gồm: age, overall, potential, international_reputation, positionGoalkeeper, crossing, finishing, short_passing, volleys, stamina, release_clause. Điều này cho thấy các biến này đều có ý nghĩa thống kê rất cao
+> -   Việc có nhiều biến có ý nghĩa thống kê cao thường cho thấy mô hình hồi quy được xây dựng là phù hợp và có khả năng giải thích tốt dữ liệu. Mặc dù các biến này đều có ý nghĩa thống kê, cần cân nhắc về ý nghĩa thực tiễn của chúng. Một số biến có thể không có ý nghĩa thực tế mạnh dù có ý nghĩa thống kê cao.
+
+### 1.2 Đánh giá mô hình
+
+```{r}
+set.seed(21)
+ctrl <- trainControl(method = "cv", number = 10)
+cv_value_model <- train(value ~ ., data = simplified_data, method = "lm", trControl = ctrl)
+print(cv_value_model)
+```
+
+> **Nhận xét**:
+>
+> -   Dựa vào kết quả từ đoạn code trên, với các giá trị RRMSE = 0.575626, R-squared = 0.573021, và MAE = 0.2563513, so sánh với kết quả của hàm summary.lm trong mục Mô hình hồi quy tuyến tính cho cột value, ta nhận thấy mô hình có khả năng giải thích rất cao khi sử dụng tất cả các biến độc lập. Điều này được thể hiện qua giá trị R-squared gần bằng 1, cho thấy mô hình phù hợp với dữ liệu và có độ chính xác cao trong việc dự đoán.
+> -   Tuy nhiên, mô hình hiện tại sử dụng rất nhiều biến giải thích, do đó, ta tìm cách đơn giản hóa mô hình
+
+## 2. Lựa chọn mô hình
+
+### 2.1 Hồi quy từng bước và cross-validation
+
+```{r}
+predict.regsubsets <- function(object, newdata, id_model){
+  form <- as.formula(object$call[[2]])
+  x_mat <- model.matrix(form, newdata)
+  coef_est <- coef(object, id = id_model)
+  x_vars <- names(coef_est)
+  res <- x_mat[, x_vars] %*% coef_est
+  return(as.numeric(res))
+}
+
+# Chia bộ dữ liệu thành các folds
+nrows <- nrow(simplified_data)
+k <- 10
+
+set.seed(21)
+folds <-  sample(rep(1:k,length=nrows))
+
+cv_error_rj <-  matrix(0,nrow=k,ncol=ncol(simplified_data))
+
+for(r in 1:k){
+  data_train_r  <-  simplified_data[folds != r,]
+  data_test_r <-  simplified_data[folds == r,]
+  steps_wise <- regsubsets(x=value ~ . ,data=data_train_r,  method="forward", really.big = TRUE, nvmax = ncol(simplified_data))
+  
+  for(j in 1:ncol(simplified_data)){
+    pred_rj <-  predict(steps_wise, newdata = data_test_r,id_model = j)
+    cv_error_rj[r,j]<-sqrt(mean((data_test_r$value - pred_rj)^2))
+  }
+}
+
+cv_error <- colMeans(cv_error_rj)
+
+
+ggplot(data= data.frame(x= c(1:ncol(simplified_data)),y=cv_error), mapping=aes(x=x,y=y)) +
+  geom_point() +
+  geom_line()+
+  labs(x="Number of predictors",y="RMSE") +
+  theme_bw()
+```
+
+> **Nhận xét**:
+>
+> -   Ta lựa chọn số biến cho mô hình tối ưu có số biến là 12
+
+```{r}
+steps_wise <- regsubsets(x = value~ ., data=simplified_data, method="forward", really.big = TRUE, nvmax = ncol(simplified_data))
+
+selected_steps_wise <- coef(steps_wise, id =  12)
+selected_steps_wise
+
+```
+
+```{r}
+# Tạo công thức cho mô hình hồi quy
+steps_wise_formula <- as.formula(paste("value ~", paste(names(coef(steps_wise, id = 12))[-1], collapse = " + ")))
+steps_wise_formula <- update(steps_wise_formula, . ~ . - positionForward - positionMidfielder)
+steps_wise_formula <- update(steps_wise_formula, . ~ . + position)
+steps_wise_formula
+
+# Sử dụng k-folds cross-validation để đánh giá mô hình
+set.seed(21)
+ctrl <- trainControl(method = "cv", number = 10)
+cv_steps_wise_value_model <- train(steps_wise_formula, data = simplified_data, method = "lm", trControl = ctrl)
+print(cv_steps_wise_value_model)
+
+```
+
+> **Nhận xét**:
+>
+> -   Sau khi giảm số biến giải thích xuống còn 12 biến, mô hình vẫn có khả năng giải thích rất cao với MSE = 0.5736017 và MAE = 0.2543194. Điều này cho thấy mô hình vẫn giữ được độ chính xác cao trong việc dự đoán giá trị của biến phụ thuộc, mặc dù số lượng biến giải thích đã giảm đáng kể. Việc giảm số biến giải thích giúp đơn giản hóa mô hình, làm cho nó dễ hiểu hơn và giảm nguy cơ overfitting (quá khớp) khi áp dụng trên dữ liệu mới.
+
+### 2.2 Hồi quy lasso
+
+Lasso (Least Absolute Shrinkage and selection Operator) nổi tiếng với khả năng lựa chọn biến bằng cách co một số hệ số về 0. Điều này rất hữu ích khi xử lý dữ liệu có nhiều biến dự đoán. Tuy nhiên, Lasso vẫn giả định mối quan hệ tuyến tính giữa các biến dự đoán còn lại và biến kết quả.
+
+```{r}
+x_data <- model.matrix(value ~ ., data = simplified_data)[,-1]
+y_data <- simplified_data$value
+
+
+# Tìm hệ só lambda tối ưu bằng phương pháp cross-validation
+set.seed(24)
+out_cv_lasso_value <- cv.glmnet(x = x_data, y = y_data, alpha = 1, type.measure = "mse", nfolds = 10, family = "gaussian")
+lambda_lasso_value <- out_cv_lasso_value$lambda.min
+cat("Hệ số lambda tối ưu là: ", lambda_lasso_value)
+ 
+```
+
+```{r}
+# Từ giá trị lambda tối ưu tìm được, fit mô hình trên toàn bộ tập data
+out_lasso_md <- glmnet(x = x_data, y = y_data, alpha = 1, lambda = lambda_lasso_value, family = "gaussian")
+
+# Các hệ số trong mô hình
+coeff_lasso_md <- predict(out_lasso_md, type = "coefficients")
+nonzero_coeff_lasso_md <- setNames(coeff_lasso_md@x, rownames(coeff_lasso_md)[coeff_lasso_md@i + 1])
+nonzero_coeff_lasso_md
+```
+
+> **Nhận xét**
+>
+> -   Các biến dự đoán có ý nghĩa: Các hệ số của các biến dự đoán sau không bằng không, cho thấy chúng có ý nghĩa trong việc dự đoán biến phản hồi: `overall`: 0.0131, `wage`: 5.6743, `international_reputation`: 0.3363, `volleys`: 0.0007, `reactions`: 0.0002, `stamina`: 0.0005, `release_clause`: 0.4862
+> -   Diễn giải:
+>     -   `wage` có hệ số dương lớn nhất, cho thấy nó có tác động mạnh mẽ đến biến phản hồi.
+>     -   `release_clause` cũng có hệ số dương đáng kể, cho thấy nó là một biến dự đoán quan trọng.
+>     -   Các hệ số không bằng không của `overall`, `international_reputation`, `volleys`, `reactions`, và `stamina` chỉ ra rằng các biến này cũng đóng góp vào mô hình, mặc dù ít hơn.
+
+**Đánh giá mô hình**
+
+```{r}
+set.seed(21)
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(simplified_data)))
+
+cv_rmse <- numeric(k)
+cv_rsquare <- numeric(k)
+cv_rsquare_adjusted <- numeric(k)
+
+for (i in 1:k) {
+  train_indices <- which(folds != i)
+  test_indices <- which(folds == i)
+  
+  train_data <- simplified_data[train_indices, ]
+  test_data <- simplified_data[test_indices, ]
+  
+  x_train <- model.matrix(value ~ ., data = train_data)[, -1]
+  y_train <- train_data$value
+  x_test <- model.matrix(value ~ ., data = test_data)[, -1]
+  y_test <- test_data$value
+  
+  out_lasso <- glmnet(x = x_train, y = y_train, alpha = 1, lambda = lambda_lasso_value, family = "gaussian")
+  pred <- predict(out_lasso, s = lambda_lasso_value, newx = x_test)
+  
+  cv_rmse[i] <- rmse(y_test, pred)
+  cv_rsquare[i] <- cor(y_test, pred)^2
+  cv_rsquare_adjusted[i] <- 1 - (1 - cv_rsquare[i]) * (length(y_test) - 1) / (length(y_test) - length(out_lasso$df))
+}
+
+avg_rmse <- mean(cv_rmse)
+avg_rsquare <- mean(cv_rsquare)
+avg_rsquare_adjusted <- mean(cv_rsquare_adjusted)
+
+cat("Average RMSE: ", avg_rmse)
+cat("\nAverage R-squared: ", avg_rsquare)
+cat("\nAverage R-squared adjusted: ", avg_rsquare_adjusted)
+```
+
+## 3 Chuẩn đoán mô hình
+
+### 3.1 Kiểm tra tính tuyến tính và Tính đồng nhất phương sai
+
+```{r}
+pred_lasso_md <- predict(out_lasso_md, newx = x_data)
+residual_lasso_md <- pred_lasso_md - simplified_data$value
+
+ggplot(data = simplified_data, mapping = aes(x = pred_lasso_md, y = residual_lasso_md)) +
+ geom_point() +
+ geom_smooth(method = "loess", se = FALSE) +
+ geom_hline(yintercept = 0, linetype = "dashed") +
+ labs(x = "Fittted values", y = "Residuals") +
+ theme_minimal()
+```
+
+> **Nhận xét**
+>
+> -   Đường trung bình phần dư (đường màu xanh) khá tương đồng với đường thẳng. Điều này có thể là dấu hiệu của mối quan hệ tuyến tính giữa value và một hoặc nhiều biến hồi quy.
+> -   Các cầu thủ có giá trị thấp chiếm số lượng lớn, gây ra sự tập trung dày đặc trong đồ thị phần dư ở khu vực fitted values nhỏ. Ngược lại, số lượng cầu thủ có giá trị cao ít hơn, dẫn đến phần dư phân tán nhiều hơn ở các giá trị fitted values lớn. Điều này cho thấy phương sai của phần dư không đồng đều, vi phạm giả định về homoscedasticity (phương sai phần dư đồng đều) trong hồi quy tuyến tính.
+
+### 3.2 Kiểm tra tính tuyến tính từng phần
+
+```{r warning=FALSE}
+fitted_lasso_md <- predict(out_lasso_md, newx = x_data)
+resid_lasso_md <- y_data - fitted_lasso_md
+selected_var_lasso_md <- names(nonzero_coeff_lasso_md[-1, drop = FALSE])
+
+
+for(col_name in selected_var_lasso_md){
+    terms <- x_data[, col_name] * nonzero_coeff_lasso_md[col_name]
+    p <- ggplot(x_data, mapping = aes(x_data[, col_name], resid_lasso_md + terms)) +
+    geom_point() +
+    labs(x = col_name, y = "Partial Residuals") +
+    geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "forestgreen") +
+    geom_line(aes(x = x_data[, col_name], y = terms), color = "blue")
+    theme_bw()
+    print(p)
+}
+```
+
+> **Nhận xét**
+>
+> **overall**:\
+> - Mối quan hệ phi tuyến tính: Đường smooth có xu hướng tăng lên khi giá trị "overall" tăng lên. Điều này cho thấy mối quan hệ giữa biến "overall" và biến kết quả có thể không tuyến tính - Heteroscedasticity (phương sai không đồng nhất): Sự phân tán của các điểm quanh đường smooth không đồng đều. Khi giá trị "overall" tăng lên (khoảng 75 trở lên), các điểm trở nên phân tán rộng hơn, đặc biệt là ở các giá trị trên 80.
+>
+> **international_reputation**:\
+> - Mối quan hệ tuyến tính yếu: "international_reputation" trong mô hình Lasso. Đường màu xanh dương có độ dốc rất nhỏ, gần như bằng phẳng, cho thấy mối quan hệ tuyến tính giữa biến này và biến kết quả là rất yếu.\
+> - Heteroscedasticity: Sự phân tán của các điểm có vẻ không đồng đều giữa các mức độ. Có vẻ như ở mức độ 3, các điểm phân tán rộng hơn so với các mức độ khác.\
+>
+> **Voleys**:\
+> - Mối quan hệ phi tuyến tính nhẹ: Đường smooth cho thấy một mối quan hệ phi tuyến tính nhẹ giữa "volleys" và biến kết quả. Ở các giá trị "volleys" thấp và trung bình, đường smooth khá bằng phẳng, nhưng có xu hướng hơi tăng ở các giá trị "volleys" cao. - Phân bố dữ liệu tập trung: Phần lớn dữ liệu tập trung ở các giá trị "volleys" từ khoảng 0 đến 80. **release_clause**:\
+> - Mối quan hệ tuyến tính mạnh mẽ: Đường smooth gần như trùng khớp với đường thẳng màu xanh dương, cho thấy một mối quan hệ tuyến tính rất mạnh mẽ giữa "release_clause" và biến kết quả. - Sự phân tán tương đối đồng đều: Các điểm dữ liệu phân tán khá đều quanh đường thẳng, không có dấu hiệu rõ ràng của heteroscedasticity (phương sai không đồng nhất).
+
+## 4. Mở rộng mô hình
+
+### 4.1 Hồi quy đa thức
+
+-   Dựa vào các biểu đồ kiểm tra tính tuyến tính từng phần, ta thấy rằng các biến `overall`, `wage`, `volleys` và `release_clause` có mối quan hệ phi tuyến tính với biến phụ thuộc. Do đó, ta sẽ xây dựng mô hình hồi quy đa thức cho các biến này.
+
+```{r}
+poly_value_md <- lm(value ~  release_clause + poly(overall, 3) + poly(wage, 3) + international_reputation + poly(volleys,2) + stamina + release_clause*wage, data = simplified_data)
+
+summary(poly_value_md)
+```
+
+**Đánh giá mô hình bằng phương pháp cross-validation**
+
+```{r}
+set.seed(21)
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(simplified_data)))
+
+cv_rmse <- numeric(k)
+cv_rsquare <- numeric(k)
+cv_rsquare_adjusted <- numeric(k)
+
+for (i in 1:k) {
+  train_indices <- which(folds != i)
+  test_indices <- which(folds == i)
+  
+  train_data <- simplified_data[train_indices, ]
+  test_data <- simplified_data[test_indices, ]
+  y_test <- test_data$value
+  
+  poly_value_md <- lm(value ~  release_clause + poly(overall, 3) + poly(wage, 3) + international_reputation + poly(volleys,2) + stamina , data = train_data)
+  pred <- predict(poly_value_md, newdata = test_data)
+  
+
+  cv_rmse[i] <- rmse(y_test, pred)
+  cv_rsquare[i] <- cor(y_test, pred)^2
+  cv_rsquare_adjusted[i] <- 1 - (1 - cv_rsquare[i]) * (length(y_test) - 1) / (length(y_test) - length(out_lasso$df))
+}
+
+
+avg_rmse <- mean(cv_rmse)
+avg_rsquare <- mean(cv_rsquare)
+avg_rsquare_adjusted <- mean(cv_rsquare_adjusted)
+
+cat("Average RMSE: ", avg_rmse)
+cat("\nAverage R-squared: ", avg_rsquare)
+cat("\nAverage R-squared adjusted: ", avg_rsquare_adjusted)
+```
+
+### 4.2 Mô hình hồi quy tổng quát
+
+```{r}
+gam_value_md <- gam(value ~  release_clause + s(overall) + s(wage) + international_reputation + s(volleys) + stamina + release_clause*wage, data = simplified_data)
+summary(gam_value_md)
+
+predictions <- predict(gam_value_md, newdata = simplified_data)
+mse <- mean((simplified_data$value - predictions)^2)
+rmse <- sqrt(mse)
+print(rmse)
+```
+
+**Đánh giá mô hình bằng phương pháp cross-validation**
+
+```{r}
+set.seed(21)
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(simplified_data)))
+
+cv_rmse <- numeric(k)
+cv_rsquare <- numeric(k)
+cv_rsquare_adjusted <- numeric(k)
+
+for (i in 1:k) {
+  train_indices <- which(folds != i)
+  test_indices <- which(folds == i)
+  
+  train_data <- simplified_data[train_indices, ]
+  test_data <- simplified_data[test_indices, ]
+  y_test <- test_data$value
+  
+  gam_value_md <- gam(value ~  release_clause + s(overall) + s(wage) + international_reputation + s(volleys) + stamina + release_clause*wage, data = train_data)
+  pred <- predict(gam_value_md, newdata = test_data)
+  
+
+  cv_rmse[i] <- rmse(y_test, pred)
+  cv_rsquare[i] <- cor(y_test, pred)^2
+  cv_rsquare_adjusted[i] <- 1 - (1 - cv_rsquare[i]) * (length(y_test) - 1) / (length(y_test) - length(out_lasso$df))
+}
+
+
+avg_rmse <- mean(cv_rmse)
+avg_rsquare <- mean(cv_rsquare)
+avg_rsquare_adjusted <- mean(cv_rsquare_adjusted)
+
+cat("Average RMSE: ", avg_rmse)
+cat("\nAverage R-squared: ", avg_rsquare)
+cat("\nAverage R-squared adjusted: ", avg_rsquare_adjusted)
+```
+
+## 5. Kết luận
+
+-   Sau khi xây dựng mô hình hồi quy tuyến tính, hồi quy lasso, hồi quy đa thức và hồi quy GAM, ta nhận thấy rằng mô hồi quy GAM có khả năng giải thích tốt nhất với Average RMSE: 0.5166711 Average R-squared: 0.9917792, Average R-squared adjusted: 0.9917792.
+-   Tổng số biến giải thích sử dụng cho mô hình này là 6 biến giải thích, bao gồm: `release_clause`, `overall`, `wage`, `international_reputation`, `volleys` và `stamina`.
+
+# IV. Linear Regresion cho wage
+
+```{r message=FALSE}
+wage_lm <- lm(wage ~ ., data = simplified_data)
+
+summary(wage_lm)
+```
+
+- Ta nhận thấy độ chính xác của mô hình rất thấp
+
+## 1. Lựa chọn mô hình
+
+### 1.1 Hồi quy từng bước và cross-validation
+
+```{r}
+predict.regsubsets <- function(object, newdata, id_model){
+  form <- as.formula(object$call[[2]])
+  x_mat <- model.matrix(form, newdata)
+  coef_est <- coef(object, id = id_model)
+  x_vars <- names(coef_est)
+  res <- x_mat[, x_vars] %*% coef_est
+  return(as.numeric(res))
+}
+
+# Chia bộ dữ liệu thành các folds
+nrows <- nrow(simplified_data)
+k <- 10
+
+set.seed(23)
+folds <-  sample(rep(1:k,length=nrows))
+
+cv_error_rj <-  matrix(0,nrow=k,ncol=ncol(simplified_data))
+
+for(r in 1:k){
+  data_train_r  <-  simplified_data[folds != r,]
+  data_test_r <-  simplified_data[folds == r,]
+  steps_wise <- regsubsets(x=wage ~ . ,data=data_train_r,  method="forward", really.big = TRUE, nvmax = ncol(simplified_data))
+  
+  for(j in 1:ncol(simplified_data)){
+    pred_rj <-  predict(steps_wise, newdata = data_test_r,id_model = j)
+    cv_error_rj[r,j]<-sqrt(mean((data_test_r$value - pred_rj)^2))
+  }
+}
+
+cv_error <- colMeans(cv_error_rj)
+
+ggplot(data= data.frame(x= c(1:ncol(simplified_data)),y=cv_error), mapping = aes(x = x,y=y)) +
+  geom_point() +
+  geom_line()+
+  labs(x="Number of predictors",y="RMSE") +
+  theme_bw()
+```
+
+```{r}
+out_subset_wage <- regsubsets(x = wage ~ ., data = simplified_data, method = "forward", nvmax = ncol(simplified_data))
+coef(out_subset_wage, id = which.min(cv_error))
+```
+
+**Đánh giá mô hình**
+
+```{r}
+# Tạo công thức cho mô hình hồi quy
+subset_wage_formula <- as.formula(paste("wage ~", paste(names(coef(out_subset_wage, id = which.min(cv_error)))[-1], collapse = " + ")))
+#subset_wage_formula <- update(subset_wage_formula, . ~ . - positionMidfielder)
+#subset_wage_formula <- update(subset_wage_formula, . ~ . + position)
+subset_wage_formula
+
+# Sử dụng k-folds cross-validation để đánh giá mô hình
+set.seed(21)
+ctrl <- trainControl(method = "cv", number = 10)
+cv_subset_wage <- train(subset_wage_formula, data = simplified_data, method = "lm", trControl = ctrl)
+print(cv_subset_wage)
+```
+
+### 1.2 Hồi quy lasso
+
+Lasso (Least Absolute Shrinkage and selection Operator) nổi tiếng với khả năng lựa chọn biến bằng cách co một số hệ số về 0. Điều này rất hữu ích khi xử lý dữ liệu có nhiều biến dự đoán. Tuy nhiên, Lasso vẫn giả định mối quan hệ tuyến tính giữa các biến dự đoán còn lại và biến kết quả.
+
+```{r}
+x_data_wage <- model.matrix(wage ~ ., data = simplified_data)[,-1]
+y_data_wage <- simplified_data$wage
+
+
+# Tìm hệ só lambda tối ưu bằng phương pháp cross-validation
+set.seed(21)
+out_cv_lasso_wage <- cv.glmnet(x = x_data_wage, y = y_data_wage, alpha = 1, type.measure = "mse", nfolds = 10, family = "gaussian")
+lambda_lasso_wage <- out_cv_lasso_wage$lambda.min
+cat("Hệ số lambda tối ưu là: ", lambda_lasso_wage)
+ 
+```
+
+```{r}
+# Từ giá trị lambda tối ưu tìm được, fit mô hình trên toàn bộ tập data
+out_lasso_wage <- glmnet(x = x_data_wage, y = y_data_wage, alpha = 1, lambda = lambda_lasso_wage, family = "gaussian")
+
+# Các hệ số trong mô hình
+coeff_lasso_wage <- predict(out_lasso_wage, type = "coefficients")
+nonzero_coeff_lasso_wage <- setNames(coeff_lasso_wage@x, rownames(coeff_lasso_wage)[coeff_lasso_wage@i + 1])
+sort(nonzero_coeff_lasso_wage, decreasing = T)
+```
+
+> **Nhận xét**
+>
+> -   Từ hệ số của các biến trong mô hình hồi quy Lasso, ta thấy chỉ có hệ số của các biến giải thích như `overall`, `international_reputation`, `volleys`, `reactions`, `stamina`, `release_clause` khác 0, cho thấy các biến này có ảnh hưởng đến biến kết quả `wage`.
+> -   Từ hệ số của các biến trong mô hình hồi quy Lasso, ta các biến giải thích sau international_reputation, position, value, release_clause có hệ số lớn nhât
+
+**Đánh giá mô hình**
+
+```{r}
+set.seed(21)
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(simplified_data)))
+
+cv_rmse <- numeric(k)
+cv_rsquare <- numeric(k)
+cv_rsquare_adjusted <- numeric(k)
+
+for (i in 1:k) {
+  train_indices <- which(folds != i)
+  test_indices <- which(folds == i)
+  
+  train_data <- simplified_data[train_indices, ]
+  test_data <- simplified_data[test_indices, ]
+  
+  x_train <- model.matrix(wage ~ ., data = train_data)[, -1]
+  y_train <- train_data$wage
+  x_test <- model.matrix(wage ~ ., data = test_data)[, -1]
+  y_test <- test_data$wage
+  
+  out_lasso <- glmnet(x = x_train, y = y_train, alpha = 1, lambda = lambda_lasso_wage, family = "gaussian")
+  pred <- predict(out_lasso, s = lambda_lasso_wage, newx = x_test)
+  
+  cv_rmse[i] <- rmse(y_test, pred)
+  cv_rsquare[i] <- cor(y_test, pred)^2
+  cv_rsquare_adjusted[i] <- 1 - (1 - cv_rsquare[i]) * (length(y_test) - 1) / (length(y_test) - length(out_lasso$df))
+}
+
+avg_rmse <- mean(cv_rmse)
+avg_rsquare <- mean(cv_rsquare)
+avg_rsquare_adjusted <- mean(cv_rsquare_adjusted)
+
+cat("Average RMSE: ", avg_rmse)
+cat("\nAverage R-squared: ", avg_rsquare)
+cat("\nAverage R-squared adjusted: ", avg_rsquare_adjusted)
+```
+
+-   Từ kết quả của mô hình lasso, ta đánh giá mô hình chỉ dựa trên các biến giải thích có hệ số lớn như: international_reputation, position, value, deffensive_work_rate, skill_moves
+
+```{r}
+set.seed(21)
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(simplified_data)))
+
+cv_rmse <- numeric(k)
+cv_rsquare <- numeric(k)
+cv_rsquare_adjusted <- numeric(k)
+
+for (i in 1:k) {
+  train_indices <- which(folds != i)
+  test_indices <- which(folds == i)
+  
+  train_data <- simplified_data[train_indices, ]
+  test_data <- simplified_data[test_indices, ]
+  
+  x_train <- model.matrix(wage ~ international_reputation + position + value + deffensive_work_rate + skill_moves, data = train_data)[, -1]
+  y_train <- train_data$wage
+  x_test <- model.matrix(wage ~ international_reputation + position + value + deffensive_work_rate + skill_moves, data = test_data)[, -1]
+  y_test <- test_data$wage
+  
+  out_lasso <- glmnet(x = x_train, y = y_train, alpha = 1, lambda = lambda_lasso_wage, family = "gaussian")
+  pred <- predict(out_lasso, s = lambda_lasso_wage, newx = x_test)
+  
+  cv_rmse[i] <- rmse(y_test, pred)
+  cv_rsquare[i] <- cor(y_test, pred)^2
+  cv_rsquare_adjusted[i] <- 1 - (1 - cv_rsquare[i]) * (length(y_test) - 1) / (length(y_test) - length(out_lasso$df))
+}
+
+avg_rmse <- mean(cv_rmse)
+avg_rsquare <- mean(cv_rsquare)
+avg_rsquare_adjusted <- mean(cv_rsquare_adjusted)
+
+cat("Average RMSE: ", avg_rmse)
+cat("\nAverage R-squared: ", avg_rsquare)
+cat("\nAverage R-squared adjusted: ", avg_rsquare_adjusted)
+```
+
+> **Nhận xét**
+>
+> -   Mô hình Lasso sử dụng các biến giải thích với hệ số khác 0 cho kết quả: Average RMSE: 10.66493, Average R-squared: 0.7649227, Average R-squared adjusted: 0.7649227. Điều này cho thấy mô hình không có khả năng giải thích tốt
+> -   Sau khi chọn ra các biến giải thích như: international_reputation, position, value, deffensive_work_rate, skill_moves, mô hình có khả năng giải thích tốt hơn với Average RMSE: 10.74997, Average R-squared: 0.7610392, Average R-squared adjusted: 0.7610392. Ta thấy cả 2 mô hình không có sự khác biệt lớn về độ chính xác giữa chúng. Do đó, ta sẽ chọn mô hình Lasso sử dụng ít biến giải thích hơn để giảm độ phức tạp của mô hình.
+
+```{r}
+x_data_wage <- model.matrix(wage ~ international_reputation + position + value + deffensive_work_rate + skill_moves, data = simplified_data)[,-1]
+y_data_wage <- simplified_data$wage
+
+out_cv_lasso_wage <- cv.glmnet(x = x_data_wage, y = y_data_wage, alpha = 1, type.measure = "mse", nfolds = 10, family = "gaussian")
+lambda_lasso_wage <- out_cv_lasso_wage$lambda.min
+out_lasso_wage <- glmnet(x = x_data_wage, y = y_data_wage, alpha = 1, lambda = lambda_lasso_wage, family = "gaussian")
+coeff_lasso_wage <- predict(out_lasso_wage, type = "coefficients")
+nonzero_coeff_lasso_wage <- setNames(coeff_lasso_wage@x, rownames(coeff_lasso_wage)[coeff_lasso_wage@i + 1])
+nonzero_coeff_lasso_wage
+```
+
+## 2. Chuẩn đoán mô hình
+
+### 2.1 Kiểm tra tính tuyến tính và Tính đồng nhất phương sai
+
+```{r}
+
+pred_lasso_wage <- predict(out_lasso_wage, newx = x_data_wage)
+
+residual_lasso_wage <- pred_lasso_wage - simplified_data$wage
+
+ggplot(data = simplified_data, mapping = aes(x = pred_lasso_wage, y = residual_lasso_wage)) +
+ geom_point() +
+ geom_smooth(method = "loess", se = FALSE) +
+ geom_hline(yintercept = 0, linetype = "dashed") +
+ labs(x = "Fittted values", y = "Residuals") +
+ theme_minimal()
+```
+
+> **Nhận xét**
+>
+> -   Đường trung bình phần dư (đường màu xanh) có xu hướng cong xuống khi giá trị biến phụ thuộc tăng lên. Điều này có thể là dấu hiệu của mối quan hệ phi tuyến tuyến tính giữa wage và các biến giải thích
+> -   Các cầu thủ có giá trị thấp chiếm số lượng lớn, gây ra sự tập trung dày đặc trong đồ thị phần dư ở khu vực fitted values nhỏ. Ngược lại, số lượng cầu thủ có giá trị cao ít hơn, dẫn đến phần dư phân tán nhiều hơn ở các giá trị fitted values lớn. Ở các cầu thủ có giá trị lớn, các điểm phân tán xa đường ngang residuals 0 hơn. Vì vậy, mô hình không đáp ứng được giả định về tính đồng nhất phương sai.
+
+### 2.2 Kiểm tra tính tuyến tính từng phần
+
+```{r warning=FALSE}
+fitted_lasso_wage <- predict(out_lasso_wage, newx = x_data_wage)
+resid_lasso_wage <- simplified_data$wage - fitted_lasso_wage
+
+for(col_name in colnames(x_data_wage)){
+    terms <- x_data_wage[, col_name] * nonzero_coeff_lasso_wage[col_name]
+    p <- ggplot(x_data_wage, mapping = aes(x_data_wage[, col_name], resid_lasso_wage + terms)) +
+    geom_point() +
+    labs(x = col_name, y = "Partial Residuals") +
+    geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "forestgreen") +
+    geom_line(aes(x = x_data_wage[, col_name], y = terms), color = "blue")
+    theme_bw()
+    print(p)
+}
+```
+
+> **Nhận xét**
+>
+> **international_reputation**:\
+> - Mối quan hệ tuyến tính mạnh mẽ: Đường smooth gần như trùng khớp với đường thẳng màu xanh dương, cho thấy một mối quan hệ tuyến tính rất mạnh mẽ giữa "international_reputation" và biến kết quả.
+
+> **positionForward, positionGoalkeeper, positionMidfieler, defensive_work_rate, skill_moves**:\
+> - Các phần dư có sự phân tán lớn, đặc biệt ở cả hai đầu. Điều này có thể cho thấy một mức độ biến thiên đáng kể mà biến positionForward, positionaMildfielder không thể giải thích.
+
+## 3. Mở rộng mô hình
+
+### 3.1 Mô hình hồi quy đa thức
+
+```{r}
+
+poly_wage_md <- lm(wage ~  international_reputation + poly(value, 3) +  poly(skill_moves, 3)  , data = simplified_data)
+
+summary(poly_wage_md)
+```
+
+### 3.2 Mô hình tuyến tính tổng quát
+
+```{r}
+gam_wage_md <- gam(wage ~  international_reputation  + s(value) + value * international_reputation + skill_moves, data = simplified_data)
+summary(gam_wage_md)
+```
+
+```{r}
+predictions <- predict(gam_wage_md, newdata = simplified_data)
+mse <- mean((simplified_data$wage - predictions)^2)
+rmse <- sqrt(mse)
+print(rmse)
+```
+
+## 4. Kết luận
+
+-   So với mô hình ban đầu, mô hình cuối cùng chỉ sử dụng các biến international_reputation, value, skill_moves có kết quả tương đồng, nhưng mô hình cuối cùng đơn giản hơn rất nhiều
+-   Kết quả từ mô hình với R-squared-adjusted = 0.789, và RMSE = 10.21275 cho thấy mô hình hồi quy cho biến giải thích wage không có khả năng giải thích cho bộ dữ liệu

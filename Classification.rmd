@@ -1,0 +1,1369 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-12-30"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+# Mục tiêu phân loại:
+> 1.Phân loại theo nhóm vị trí thi đấu
+
+> 2.Phân loại cầu thủ dựa trên khả năng phù hợp với các chiến thuật của đội bóng 
+
+> 3.Phân loại theo chân thuận
+
+> 4.Phân loại danh tiếng quốc tế của cầu thủ
+
+> 5.Phân loại cầu thủ theo khả năng di chuyển khi tấn công và phòng thủ
+
+
+#Thư viện sử dụng 
+
+```{r message=FALSE}
+library(tidyverse)
+library(VIM)
+library(janitor)
+library(mice)
+library(stringr)
+library(themis)
+library(nnet)
+library(e1071)
+library(lmPerm)
+library(MASS)
+library(dplyr)
+library(caret)
+```
+
+```{r}
+data<-read.csv("cleaned_fifa_eda_stats.csv")
+```
+
+```{r}
+data <- data |> janitor::clean_names()
+glimpse(data)
+```
+
+```{r}
+data<- data[, !(names(data) %in% c("joined", "contract_valid_until"))]
+```
+
+```{r}
+n <- nrow(data)
+
+# Tạo chỉ số ngẫu nhiên cho tập huấn luyện (70%)
+set.seed(123)  
+train_index <- sample(1:n, size = 0.7 * n)  # Chọn 70% các chỉ số ngẫu nhiên
+
+# Chia dữ liệu thành tập huấn luyện (train) và tập kiểm tra (test)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+
+##1.Phân loại theo nhóm vị trí thi đấu:
+
+### A/B testing:
+>
+> Giả thuyết H0:các nhóm vị trí cầu thủ có trung bình overall như nhau
+>
+> Đối thuyết H1: Ít nhất có một nhóm có trung bình overall khác với
+> những nhóm còn lại.
+
+
+
+```{r}
+data_position_overall <- train_data |>
+  dplyr::select(position, overall) |>
+  clean_names()
+glimpse(data_position_overall)
+```
+
+
+```{r}
+data_position_overall|>group_by(position)|>
+  summarise(n=n(),mean=mean(overall))
+ggplot(data_position_overall, aes(x = position, y = overall, fill = position)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15) +
+  labs(x = "Position Group", y = "Overall") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+
+```{r}
+data_position_overall=data_position_overall[sample(nrow(train_data),10000),]
+```
+
+
+```{r}
+set.seed(56)
+library(lmPerm)
+out_aov_1 <- aovp(formula = overall ~ position, data = data_position_overall, perm = "Prob")
+summary(out_aov_1)
+```
+
+> p_value<2.2e-16\<0.05 =\>Đủ cơ sở để bác bỏ H0 nên ta kết luận có ít
+> nhất 1 nhóm có trung bìnhh overall khác với các nhóm còn lại
+
+### Kiểm tra sự cân bằng của dữ liệu
+
+```{r}
+
+set.seed(123)
+
+data_numeric_with_position <- train_data%>%
+  dplyr::select(position, where(is.numeric)) %>%
+  mutate(position = factor(position)) 
+
+  
+position_table=with(data_numeric_with_position,table(position))
+
+```
+
+```{r}
+# Vẽ biểu đồ từ bảng tần suất
+barplot(
+  position_table,
+  main = "Distribution of Positions", # Tiêu đề biểu đồ
+  xlab = "Position",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(position_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+
+grid(nx = NA, ny = NULL, col = "gray", lty = "dotted", lwd = 0.7)
+
+```
+
+
+> Dữ liệu không cân bằng nên ta dùng phương pháp SMOTE để cân bằng dữ
+> liệu
+
+
+```{r}
+# Xóa phần dữ liệu khuyết
+data_numeric_with_position <- na.omit(data_numeric_with_position)
+```
+
+```{r}
+smote_themis_position_group <- smotenc(df = data_numeric_with_position, 
+                                       var = "position", 
+                                       k = 5, 
+                                       over_ratio = 1)
+table(smote_themis_position_group$position)
+```
+
+
+###Phân loại:
+
+> Dùng mô hình Multinominal logistic để phân loại Chọn các chỉ số quan
+> trọng của các cầu thủ
+
+```{r}
+columns <- c("finishing", "positioning", "acceleration", "shot_power", "balance", 
+             "dribbling", "vision", "ball_control", "short_passing", "long_shots", 
+             "stamina", "marking", "interceptions", "strength", 
+             "heading_accuracy", "standing_tackle","crossing","agility","gk_handling", "gk_diving", "gk_kicking", "gk_positioning", "gk_reflexes")
+```
+
+```{r}
+
+formula <- as.formula(paste("position ~", paste(columns, collapse = "+")))
+out_mult=multinom(formula,data=smote_themis_position_group,maxit=200)
+
+```
+### Đánh giá mô hình
+
+```{r}
+pred_class=predict(out_mult,test_data,type="class")
+conf_matrix=table(test_data$position,pred_class)
+conf_matrix
+eval_multi_class <- function(x) {
+  cc <- sum(diag(x))
+  sc <- sum(x)
+  pp <- colSums(x)
+  tt <- rowSums(x)
+  ##
+  prec <- diag(x)/colSums(x)
+  recall <- diag(x)/rowSums(x)
+  macro_prec <- mean(prec)
+  macro_recall <- mean(recall)
+  macro_f1 <- 2 * macro_prec * macro_recall/(1/macro_prec + 1/macro_recall)
+  acc <- cc/sc
+  kap <- (cc * sc - sum(pp * tt))/(sc^2 - sum(pp * tt))
+  return(list(Precision = prec, Recall = recall, Accuracy = acc, Kappa = kap,
+              Macro_F1 = macro_f1))
+}
+eval_multi_class(conf_matrix)
+```
+
+
+
+##2.Phân loại cầu thủ dựa trên khả năng phù hợp với các chiến thuật của đội bóng 
+
+>Nhóm 1: Hight Pressing (tập trung vào kĩ năng stamina và aggression)
+
+>Nhóm 2: Fast Counter-Attack (tập trung vào kĩ năng acceleration và sprint_speed)
+
+>Nhóm 3: Control Possession (tập trung vào kĩ năng long_passing,short_passing, ball_control và vision)
+
+>Nhóm 4: Other
+
+
+```{r}
+data_clean=train_data 
+```
+
+```{r}
+
+# Tạo cột 'strategy' với các điều kiện cho từng nhóm chiến thuật
+data_clean$strategy <- case_when(
+  data_clean$stamina > 70 & data_clean$aggression > 70 ~ "High Pressing",  # Nhóm 1: High Pressing
+  data_clean$acceleration > 70 & data_clean$sprint_speed > 70 ~ "Fast Counter-Attack",  # Nhóm 2: Fast Counter-Attack
+  data_clean$long_passing > 70 & data_clean$short_passing > 70 & data_clean$ball_control > 70 & data_clean$vision > 70 ~ "Control Possession",  # Nhóm 3: Control Possession
+  TRUE ~ "Other"  # Nhóm khác nếu không thỏa mãn các điều kiện trên
+)
+```
+
+
+### A/B testing:
+>
+> Giả thuyết H0: các nhóm chiến thuật có trung bình value như nhau
+>
+> Đối thuyết H1: Ít nhất có một nhóm có trung bình value khác với
+> những nhóm còn lại.
+
+
+```{r}
+data_strategy_value=data_clean|>dplyr::select(strategy,value)
+data_strategy_value=data_strategy_value|>clean_names()
+glimpse(data_strategy_value)
+data_strategy_value|>group_by(strategy)|>
+  summarise(n=n(),mean=mean(value))
+ggplot(data_strategy_value, aes(x = strategy, y = value, fill = strategy)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15) +
+  labs(x = "Strategy Group", y = "Value") +
+  theme_bw() +
+  theme(legend.strategy = "none")
+```
+```{r}
+set.seed(56)
+data_strategy_value=data_strategy_value[sample(nrow(data), 10000), ]
+library(lmPerm)
+out_aov_1 <- aovp(formula = value ~ strategy, data = data_strategy_value, perm = "Prob")
+summary(out_aov_1)
+```
+> p_value<2.2e-16\<0.05 =\>Đủ cơ sở để bác bỏ H0 nên ta kết luận có ít nhất 1 nhóm có trung bình value khác với các nhóm còn lại
+
+###Kiểm tra sự cân bằng của dữ liệu
+
+```{r}
+
+set.seed(123)
+
+data_numeric_with_strategy <- data_clean %>%
+  dplyr::select(strategy, where(is.numeric)) %>%
+  mutate(strategy = factor(strategy)) 
+
+  
+with(data_numeric_with_strategy,table(strategy))
+
+```
+> Dữ liệu không cân bằng nên ta dùng phương pháp SMOTE để cân bằng dữ
+> liệu
+
+```{r}
+# Vẽ biểu đồ từ bảng tần suất
+strategy_table=with(data_numeric_with_strategy,table(strategy))
+barplot(
+  strategy_table,
+  main = "Distribution of Strategy", # Tiêu đề biểu đồ
+  xlab = "Strategy",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(strategy_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+
+grid(nx = NA, ny = NULL, col = "gray", lty = "dotted", lwd = 0.7)
+
+```
+
+
+```{r}
+# Xóa phần dữ liệu khuyết
+data_numeric_with_strategy <- na.omit(data_numeric_with_strategy)
+```
+
+```{r}
+smote_themis_strategy_group <- smotenc(df = data_numeric_with_strategy, 
+                                       var = "strategy", 
+                                       k = 5, 
+                                       over_ratio = 1)
+table(smote_themis_strategy_group$strategy)
+```
+###Phân loại 
+
+> Dùng mô hình Multinominal logistic để phân loại Chọn các chỉ số stamina,aggression, acceleration,sprint_speed,long_passing,short_passing, ball_control và vision
+
+
+```{r}
+columns <- c("stamina","aggression", "acceleration","sprint_speed","long_passing","short_passing", "ball_control", "vision")
+```
+
+```{r}
+formula <- as.formula(paste("strategy ~", paste(columns, collapse = "+")))
+out_mult=multinom(formula,data=smote_themis_strategy_group,maxit=200)
+
+```
+
+### Đánh giá mô hình
+
+```{r}
+pred_class=predict(out_mult,data_clean,type="class")
+conf_matrix=table(data_clean$strategy,pred_class)
+conf_matrix
+eval_multi_class <- function(x) {
+  cc <- sum(diag(x))
+  sc <- sum(x)
+  pp <- colSums(x)
+  tt <- rowSums(x)
+  ##
+  prec <- diag(x)/colSums(x)
+  recall <- diag(x)/rowSums(x)
+  macro_prec <- mean(prec)
+  macro_recall <- mean(recall)
+  macro_f1 <- 2 * macro_prec * macro_recall/(1/macro_prec + 1/macro_recall)
+  acc <- cc/sc
+  kap <- (cc * sc - sum(pp * tt))/(sc^2 - sum(pp * tt))
+  return(list(Precision = prec, Recall = recall, Accuracy = acc, Kappa = kap,
+              Macro_F1 = macro_f1))
+}
+eval_multi_class(conf_matrix)
+```
+
+
+##3. Phân loại theo chân thuận:
+
+>Nhóm 1: Các cầu thủ thuận chân phải
+
+>Nhóm 2: Các cầu thủ thuận chân trái 
+
+
+```{r}
+data_clean_2=train_data 
+
+```
+
+###Kiểm tra dữ liệu có cân bằng không 
+
+```{r}
+with(data_clean_2, table(preferred_foot))
+```
+```{r}
+# Vẽ biểu đồ từ bảng tần suất
+preferred_foot_table=with(data_clean_2,table(preferred_foot))
+barplot(
+  preferred_foot_table,
+  main = "Distribution of Preferred Foot", # Tiêu đề biểu đồ
+  xlab = "Preferred Foot",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(preferred_foot_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+
+grid(nx = NA, ny = NULL, col = "gray", lty = "dotted", lwd = 0.7)
+
+```
+
+>Dữ liệu không cân bằng:
+
+>Sử dụng phương pháp under_sampling để chọn ngẫu nhiên các quan sát trong nhóm lớn (majority group) sao cho số
+lượng phần tử trong nhóm này sẽ bằng với nhóm nhỏ (minority group)
+
+```{r}
+under_sampling_2c <- function(data, name_class){
+new_data <- data
+class_fact <- as.factor(data[, name_class])
+data_split <- split(data, class_fact)
+n_class <- sapply(data_split, FUN = nrow)
+n_minor <- min(n_class)
+n_major <- max(n_class)
+id_major_class <- which.max(n_class)
+id_minor_class <- which.min(n_class)
+id_major <- sample(1:n_major, size = n_minor, replace = FALSE)
+new_data_major <- data_split[[id_major_class]][id_major, ]
+new_data <- rbind(data_split[[id_minor_class]], new_data_major)
+return(new_data)
+}
+```
+
+```{r}
+set.seed(234)
+data_clean_2 <- as.data.frame(data_clean_2)
+preferred_foot_under <- under_sampling_2c(data_clean_2, "preferred_foot")
+with(preferred_foot_under, table(preferred_foot))
+```
+>Chuyển cột preferred_foot về numeric 
+
+```{r}
+preferred_foot_under <- preferred_foot_under %>%
+  mutate(
+    preferred_foot = case_when(
+      preferred_foot == "Right" ~ 1,
+      preferred_foot == "Left" ~ 0,
+      TRUE ~ NA_real_  # Nếu không khớp với điều kiện nào
+  )
+)
+```
+
+```{r}
+data_clean_2 <- data_clean_2 %>%
+  mutate(
+    preferred_foot = case_when(
+      preferred_foot == "Right" ~ 1,
+      preferred_foot == "Left" ~ 0,
+      TRUE ~ NA_real_  # Nếu không khớp với điều kiện nào
+  )
+  )
+```
+
+###Phân loại 
+>Xây dựng mô hình phân loại logistic 
+
+```{r}
+out_md <- glm(formula = preferred_foot ~ weak_foot + dribbling + ball_control+finishing+crossing+agility+strength+positioning+short_passing+long_passing, data =preferred_foot_under,
+family = binomial)
+```
+
+
+```{r}
+summary(out_md)
+```
+>Sử dụng dự đoán 10 cầu thủ đầu tiên của data 
+
+```{r}
+test=head(test_data, 10)
+```
+
+```{r}
+test$preferred_foot
+```
+
+```{r}
+pred_prob <- predict(out_md, newdata = test, type = "response")
+ifelse(pred_prob > 0.5, "Right", "Left")
+```
+
+###Đánh giá mô hình phân loại nhị phân 
+
+>Tính xác suất dự đoán cho tất cả các quan sát trong dữ liệu.
+
+```{r}
+prob_pred_dt<- predict(out_md,newdata = test_data, type = "response")
+```
+
+>Chọn ngưỡng threshold mặc định là 0.5 
+
+```{r}
+threshold <- 0.5  # Ngưỡng mặc định
+predicted_class <- ifelse(prob_pred_dt >= threshold, 1, 0)
+```
+
+```{r}
+test_data$preferred_foot <- ifelse(test_data$preferred_foot == "Right", 1, 0)
+```
+
+
+```{r}
+conf_matrix <- confusionMatrix(as.factor(predicted_class), as.factor(test_data$preferred_foot))
+print(conf_matrix)
+```
+
+
+```{r}
+library(pROC)
+out_roc <- roc(test_data$preferred_foot , prob_pred_dt)
+```
+>Ước lượng AUC
+
+```{r}
+out_roc$auc
+```
+
+>Khoảng tin cậy 95% cho AUC
+
+```{r}
+ci.auc(out_roc, conf.level = 0.95)
+
+```
+
+>Vẽ đường cong ROC ước lượng
+
+```{r}
+plot(out_roc, legacy.axes = TRUE, asp = 0)
+```
+
+>Đường cong ROC nằm trên bên trái đường tham chiếu nhưng không quá cao nhưng mô hình vẫn có khả năng dự đoán phân loại có tính chính xác chấp nhận được 
+
+>Giá trị của AUC ước lượng của mô hình là 0.6998,95% CI: 0.6825-0.7171 , do đó mô hình Logistic có độ chính xác chấp nhận được để dự đoán chân thuận của cầu thủ 
+
+
+##Tìm ngưỡng threshold tối ưu 
+
+>Youden index giúp tối ưu hóa sự kết hợp giữa sensitivity và specificity
+
+```{r}
+out_youd <- coords(out_roc, "best", ret = c("threshold", "specificity", "sensitivity"),
+best.method = "youden")
+print(out_youd)
+```
+```{r}
+predicted_class <- ifelse(prob_pred_dt >= out_youd$threshold, 1, 0)
+conf_matrix <- confusionMatrix(as.factor(predicted_class), as.factor(test_data$preferred_foot))
+print(conf_matrix)
+```
+>Với ngưỡng out_youd$threshold ta được Accuracy cao hơn là 0.7231
+
+
+>Closest top left tìm ngưỡng sao cho điểm trên ROC curve gần nhất với điểm lý tưởng (1, 1) - là điểm có sensitivity và specificity tối đa
+
+```{r}
+out_clost <- coords(out_roc, "best", ret = c("threshold", "specificity", "sensitivity"),
+best.method = "closest.topleft")
+print(out_clost)
+```
+
+```{r}
+predicted_class <- ifelse(prob_pred_dt >= out_clost$threshold, 1, 0)
+conf_matrix <- confusionMatrix(as.factor(predicted_class), as.factor(test_data$preferred_foot))
+print(conf_matrix)
+```
+>Với ngưỡng out_clost$threshold ta được Accuracy là 0.6638 cao hơn là ngưỡng mặc định 0.5 nhưng chưa tối ưu bằng out_youd$threshold
+
+
+
+>Phân loại Naive Bayes:
+
+```{r}
+out_nb <- naiveBayes(formula = preferred_foot ~ weak_foot + dribbling + ball_control+finishing+crossing+agility+strength+positioning+short_passing+long_passing,
+data = preferred_foot_under)
+```
+
+>Đánh giá mô hình phân loại nhị phân 
+
+
+>Dự đoán xác suất cho lớp 1 (chân phải) từ mô hình Naive Bayes. Dữ liệu trả về sẽ có 2 cột, và [ , 2] sẽ chọn cột xác suất của lớp 1.
+
+```{r}
+pred_prob <- predict(out_nb, newdata = test_data, type = "raw")[, 2]
+out_roc <- roc(test_data$preferred_foot, pred_prob)
+```
+>Chọn ngưỡng threshold mặc định là 0.5 
+
+```{r}
+threshold <- 0.5  # Ngưỡng mặc định
+predicted_class <- ifelse(pred_prob >= threshold, 1, 0)
+```
+
+```{r}
+predicted_class <- factor(predicted_class, levels = c(0, 1))
+test_data$preferred_foot <- factor(test_data$preferred_foot, levels = c(0, 1))
+conf_matrix <- confusionMatrix(predicted_class, test_data$preferred_foot)
+
+```
+
+```{r}
+print(conf_matrix)
+```
+
+
+```{r}
+out_roc$auc
+```
+
+>Khoảng tin cậy 95% cho AUC
+
+```{r}
+ci.auc(out_roc, conf.level = 0.95)
+
+```
+
+>Vẽ đường cong ROC ước lượng
+
+```{r}
+plot(out_roc, legacy.axes = TRUE, asp = 0)
+```
+
+>Đường cong ROC nằm trên bên trái đường tham chiếu nhưng không cao bằng mô hình phân loại logistic nhưng mô hình vẫn có khả năng dự đoán phân loại có tính chính xác chấp nhận được 
+
+>Giá trị của AUC ước lượng của mô hình là 0.6204,95% CI: 95% CI: 0.6024-0.6385, do đó mô hình Naive Bayes có độ chính xác chấp nhận được để dự đoán chân thuận của cầu thủ nhưng kém hơn là mô hình logistic  
+
+## 4.Danh tiếng quốc tế của cầu thủ
+
+### Chuẩn hoá cho các cột có giá trị định tính.
+
+```{r}
+data <- data %>%
+  mutate(
+    preferred_foot = as.factor(preferred_foot),
+    #international_reputation = as.factor(international_reputation),
+    position = as.factor(position),
+    body_type = as.factor(body_type),
+    skill_moves = as.factor(skill_moves),
+    weak_foot = as.factor(weak_foot)
+  )
+
+
+```
+
+## 5.international_reputation
+
+```{r}
+data_reputation<-data
+table(data_reputation$international_reputation)
+```
+
+### A/B Testing
+
+> -   Giả thuyết H0:các nhóm cầu thủ có độ nổi tiếng khác nhau thì có trung bình wage như nhau.
+
+> -   Đối thuyết H1: Ít nhất có một nhóm có trung bình wage khác với những nhóm còn lại.
+
+```{r}
+data_reputation|>group_by(international_reputation)|>
+  summarise(n=n(),mean=mean(wage))
+```
+
+```{r}
+ggplot(data_reputation, aes(x = as.factor(international_reputation), y = wage, fill = as.factor(international_reputation))) +
+  geom_violin() +
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9)) +
+  labs(x = "Reputation Group", y = "Wage") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+data_repu=data_reputation[sample(nrow(data), 10000), ]
+```
+
+```{r}
+set.seed(56)
+out_aov_1 <- aovp(formula = overall ~ international_reputation, 
+                  data = data_repu, 
+                  perm = "Prob")
+```
+
+```{r}
+summary(out_aov_1)
+```
+
+> -   p_value\<2.2e-16\<0.05 =\>Đủ cơ sở để bác bỏ H0 nên ta kết luận có
+>     ít nhất 1 nhóm có trung bìnhh overall khác với các nhóm còn lại
+
+```{r}
+#Vẽ biểu đồ cột
+international_reputation_table=with(data_reputation,table(international_reputation))
+barplot(
+  international_reputation_table,
+  main = "Distribution of International Reputation", # Tiêu đề biểu đồ
+  xlab = "International Reputation",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(international_reputation_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+
+```
+
+>** Nhận xét:**
+>
+> -   Cột international_reputation có 5 giá trị duy nhất từ 1 đến 5.Đây là các biến định tính.
+> -   Số lượng cầu thủ có danh tiếng quốc tế từ 1 đến 5 là không đồng đều.
+> -   Số lượng cầu thủ có danh tiếng quốc tế từ 1 đến 2 chiếm phần lớn trong khi số lượng cầu thủ có danh tiếng quốc tế từ 3 đến 5 chiếm  phần rất nhỏ.
+> -Cần phải xử lý dữ liệu để cân bằng số lượng cầu thủ có danh tiếng  quốc tế từ 1 đến 5.
+
+### Hồi quy logistic đa lớp
+
+```{r}
+data_reputation_2<-data
+table(data_reputation_2$international_reputation)
+```
+```{r}
+data_reputation_2$international_reputation <- factor(data_reputation_2$international_reputation)
+```
+
+```{r}
+set.seed(123)
+data_reputation_2 <- smotenc(
+  df = data_reputation_2,
+  var = "international_reputation",
+  k = 5,
+  over_ratio = 1
+)
+```
+
+```{r}
+table(data_reputation_2$international_reputation)
+```
+
+```{r}
+train_index <- sample(1:nrow(data_reputation_2), size = 0.8 * nrow(data_reputation_2))
+train_data <- data_reputation_2[train_index, ]
+test_data <- data_reputation_2[-train_index, ]
+```
+
+
+```{r}
+selected_variables <- c("age", "overall", "potential", "value", "wage", 
+                        "height", 
+                        "weight", "short_passing", "volleys", "balance", 
+                        "shot_power", "jumping", "stamina", "aggression", 
+                        "composure", "release_clause")
+```
+
+```{r}
+formula <- as.formula(paste("international_reputation ~", paste(selected_variables, collapse = "+")))
+
+logistic_model=multinom(formula,data=train_data,maxit=200)
+
+summary(logistic_model)
+```
+
+```{r}
+# Dự đoán lớp cho dữ liệu kiểm tra
+pred_class_reputation <- predict(logistic_model, newdata = test_data, type = "class")
+# Tạo confusion matrix
+conf_matrix_reputation <- table(test_data$international_reputation, pred_class_reputation)
+conf_matrix_reputation
+```
+
+```{r}
+eval_multi_class(conf_matrix_reputation)
+```
+>**Nhận xét**
+>- Kết quả thu được khá tốt  đối với các giá trị 1,2 và 4,5 nhưng không tốt cho giá trị 3
+>- Biến wage là biến quan trọng nhất để dự đoán danh tiếng quốc tế của cầu thủ. Các cầu thủ có mức lương cao đột biến có khả năng là cầu thủ có danh tiếng quốc tế cao.CHo nên khả năng nhận diện của các cầu thủ này thì vô cùng đơn giản và dễ dàng. do đó, Chúng ta thử chỉ áp dụng mô hình cho các cầu thủ có danh tiếng quốc tế  1 và 2.Để xem xét mô hình có thể dự đoán chính xác danh tiếng quốc tế của cầu thủ hay không.
+
+> Loại bỏ các giá trị 3,4,5 của international_reputation
+
+```{r}
+data_reputation<- data %>%
+  filter(!(international_reputation %in% c(3, 4, 5)))
+
+table(data_reputation$international_reputation)
+
+```
+
+> Chuẩn hoá cho cột international_reputation
+
+```{r}
+data_reputation <- data_reputation %>%
+  mutate(
+    international_reputation = as.factor(international_reputation),
+  )
+```
+
+```{r}
+str(data_reputation$international_reputation)
+```
+
+> **Nhận xét**:
+>
+> -   Cột international_reputation đã được chuyển thành factor.
+
+> Sử dụng SMOTE để cân bằng dữ liệu
+
+```{r}
+data_reputation=na.omit(data_reputation)
+```
+
+```{r}
+set.seed(26)
+data_reputation <- smotenc(
+  df = data_reputation,
+  var = "international_reputation", 
+  k = 5,  
+  over_ratio = 1
+)
+```
+
+```{r}
+table(data_reputation$international_reputation)
+```
+
+```{r}
+columns <- c("age", "overall", "potential", "value", "wage", 
+                     "international_reputation", "skill_moves", 
+                     "body_type", "position", "height","attacking_work_rate","defensive_work_rate", 
+                    "weight", "crossing", "finishing", "heading_accuracy", "short_passing", 
+                    "volleys", "dribbling", "curve", "fk_accuracy", "long_passing", "ball_control", 
+                    "acceleration", "sprint_speed", "agility", "reactions", "balance", "shot_power", 
+                    "jumping", "stamina", "strength", "long_shots", "aggression", "interceptions", 
+                    "positioning", "vision", "penalties", "composure", "marking", "standing_tackle", 
+                    "sliding_tackle","release_clause")
+```
+
+```{r}
+data_reputation<-data_reputation %>%
+  dplyr::select(all_of(columns))
+```
+
+```{r}
+glimpse(data_reputation)
+```
+### Hồi quy logistic
+
+```{r}
+set.seed(269)
+train_index <- sample(1:nrow(data_reputation), size = 0.8 * nrow(data_reputation))
+
+train_data <- data_reputation[train_index, ]
+test_data <- data_reputation[-train_index, ]
+```
+
+```{r}
+logistic_model<- glm(formula = international_reputation~., data = train_data,
+family = binomial)
+```
+
+```{r}
+summary(logistic_model)
+```
+
+*Nhận xét* 
+>- Biến international_reputation gần như có thể giải thích được bởi các biến wage
+
+
+```{r}
+pred_prob <- predict(logistic_model, newdata = test_data, type = "response")
+
+test_data$predicted_class<-ifelse(pred_prob > 0.5, 2, 1)
+
+```
+
+
+```{r}
+set.seed(153)
+test <- test_data[sample(nrow(test_data), 20), ]
+# In hai cột predicted_class và international
+print(test[, c("predicted_class", "international_reputation")])
+```
+```{r}
+conf_matrix <- confusionMatrix(as.factor(test_data$predicted_class), as.factor(test_data$international_reputation))
+print(conf_matrix)
+```
+
+
+```{r}
+library(pROC)
+# Tính toán AUC
+out_roc <- roc(test_data$international_reputation, pred_prob)
+print(out_roc$auc)
+
+```
+
+```{r}
+ci.auc(out_roc, conf.level = 0.95)
+
+```
+
+```{r}
+plot(out_roc, legacy.axes = TRUE, asp = 0)
+
+```
+
+```{r}
+out_youd <- coords(out_roc, "best", ret = c("threshold", "specificity", "sensitivity"),
+best.method = "youden")
+print(out_youd)
+
+```
+
+```{r}
+out_clost <- coords(out_roc, "best", ret = c("threshold", "specificity", "sensitivity"),
+best.method = "closest.topleft")
+print(out_clost)
+```
+
+```{r}
+pred_prob <- predict(logistic_model, newdata = test_data, type = "response")
+test_data$predicted_class<-ifelse(pred_prob> out_clost$threshold, 2, 1)
+```
+set.seed(123)
+test <- test_data[sample(nrow(test_data), 20), ]
+```{r}
+
+# In hai cột predicted_class và international
+print(test[, c("predicted_class", "international_reputation")])
+
+```
+```{r}
+conf_matrix <- confusionMatrix(as.factor(test_data$predicted_class), as.factor(test_data$international_reputation))
+print(conf_matrix)
+```
+
+
+## 6.Phân loại cầu thủ theo khả năng di chuyển khi tấn công và phòng thủ
+
+```{r}
+cat("Number of unique attack: ", unique(data$attacking_work_rate))
+
+```
+
+```{r}
+cat("Number of unique defense: ", unique(data$defensive_work_rate))
+```
+
+-   Có 3 giá trị duy nhất cho attacking_work_rate và defensive_work_rate
+    là "High", "Medium", "Low".
+-   Ta sẽ chuyển đổi giá trị cho attacking_work_rate và
+    defensive_work_rate.
+
+```{r}
+table(data$attacking_work_rate)
+```
+
+```{r}
+table(data$defensive_work_rate)
+```
+
+**Nhận xét** \> \>- Các biến đang có sự chênh lệch khá lớn do đó ta cần
+phải xử lý trước khi thực hiện việc phân loại. Cụ thể phương pháp được
+sử dụng cho trường hợp này là SMOTE (Synthetic Minority Over-sampling
+Technique) để tăng cường mẫu cho lớp thiểu số.
+
+```{r}
+library(dplyr)
+# Chuyển đổi các giá trị "High", "Medium", "Low" chuyển thành factor
+data$attacking_work_rate <- factor(data$attacking_work_rate, levels = c("High", "Medium", "Low"))
+data$defensive_work_rate <- factor(data$defensive_work_rate, levels = c("High", "Medium", "Low"))
+```
+
+```{r}
+# Kiểm tra lại kiểu dữ liệu của các cột
+str(data$attacking_work_rate)
+str(data$defensive_work_rate)
+```
+
+### Tấn công
+
+#### A/B Testing
+
+> -   Giả thuyết H0:các nhóm cầu thủ có cùng xu hướng di chuyển thì có
+>     trung bình overall như nhau.
+
+> -   Đối thuyết H1: Ít nhất có một nhóm có trung bình overall khác với
+>     những nhóm còn lại.
+
+```{r}
+set.seed(123)
+# Lựa chọn các cột cần thiết để tạo ra một data frame mới
+data_new_attack <- data[, sapply(data, function(col) is.numeric(col) || is.factor(col))]
+glimpse(data_new_attack)
+```
+
+```{r}
+data_new_attack|>group_by(attacking_work_rate)|>
+  summarise(n=n(),mean=mean(overall))
+```
+
+```{r}
+ggplot(data_new_attack, aes(x = attacking_work_rate, y = overall, fill = attacking_work_rate)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9)) +
+  labs(x = "Attack Group", y = "Overall") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+data_at=data_new_attack[sample(nrow(data), 10000), ]
+```
+
+```{r}
+set.seed(56)
+library(lmPerm)
+out_aov_1 <- aovp(formula = overall ~ attacking_work_rate, data = data_at, perm = "Prob")
+```
+
+```{r}
+summary(out_aov_1)
+```
+
+> **Nhận xét**
+>
+> -   p-value\<0.05 nên ta bác bỏ giả thuyết H0 và chấp nhận giả thuyết
+>     H1. Có ít nhất một nhóm có trung bình overall khác với các nhóm
+>     còn lại.
+
+```{r}
+#Vẽ biểu đồ cột
+attacking_work_rate_table=with(data_new_attack,table(attacking_work_rate))
+barplot(
+  attacking_work_rate_table,
+  main = "Distribution of Attacking Work Rate", # Tiêu đề biểu đồ
+  xlab = "Attacking Work Rate",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(attacking_work_rate_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+
+```
+
+#### Áp dụng SMOTE
+
+```{r}
+data_new_attack=na.omit(data_new_attack)
+```
+
+```{r}
+set.seed(123)
+
+data_new_attack <- smotenc(
+  df = data_new_attack,  # Dữ liệu ban đầu
+  var = "attacking_work_rate",  # Biến mục tiêu
+  k = 5,  
+  over_ratio = 1  # Tăng cường mẫu lớp thiểu số lên gấp đôi
+)
+```
+
+```{r}
+# Sử dụng table để xem phân phối các giá trị trong cột
+table(data_new_attack$attacking_work_rate)
+
+```
+
+####Chia tách dữ liệu
+
+```{r}
+set.seed(42)
+train_index <- sample(1:nrow(data_new_attack), size = 0.8 * nrow(data_new_attack))
+
+train_data <- data_new_attack[train_index, ]
+test_data <- data_new_attack[-train_index, ]
+
+```
+
+####Chọn các biến cần thiết
+
+```{r}
+columns <- c("age", "overall", "potential", "value", "wage", 
+                     "international_reputation", "skill_moves", 
+                     "body_type", "position", "height", 
+                    "weight", "crossing", "finishing", "heading_accuracy", "short_passing", 
+                    "volleys", "dribbling", "curve", "fk_accuracy", "long_passing", "ball_control", 
+                    "acceleration", "sprint_speed", "agility", "reactions", "balance", "shot_power", 
+                    "jumping", "stamina", "strength", "long_shots", "aggression", "interceptions", 
+                    "positioning", "vision", "penalties", "composure", "marking", "standing_tackle", 
+                    "sliding_tackle","release_clause")
+```
+
+#### Hồi quy logistic đa lớp
+
+```{r}
+formula <- as.formula(paste("attacking_work_rate ~", paste(columns, collapse = "+")))
+logistic_model=multinom(formula,data=train_data,maxit=200)
+
+summary(logistic_model)
+```
+
+```{r}
+# Dự đoán lớp cho dữ liệu kiểm tra
+pred_class_attack <- predict(logistic_model, newdata = test_data, type = "class")
+# Tạo confusion matrix
+conf_matrix_attack <- table(test_data$attacking_work_rate, pred_class_attack)
+conf_matrix_attack
+
+```
+
+```{r}
+eval_multi_class <- function(x) {
+cc <- sum(diag(x))
+sc <- sum(x)
+pp <- colSums(x)
+tt <- rowSums(x)
+##
+prec <- diag(x)/colSums(x)
+recall <- diag(x)/rowSums(x)
+macro_prec <- mean(prec)
+macro_recall <- mean(recall)
+macro_f1 <- 2 * macro_prec * macro_recall/(1/macro_prec + 1/macro_recall)
+acc <- cc/sc
+kap <- (cc * sc - sum(pp * tt))/(sc**2 - sum(pp * tt))
+return(list(Precision = prec, Recall = recall, Accuracy = acc, Kappa = kap,
+Macro_F1 = macro_f1))
+}
+eval_multi_class(conf_matrix_attack)
+
+```
+
+> **Nhận xét**
+>
+> -   Mô hình hồi quy không thật sự tốt khi dự đoán các lớp. Để cải
+>     thiện chúng ta sẽ sử dụng mô hình khác như LDA và QDA.
+
+#### LDA
+
+```{r}
+formula <- as.formula(paste("attacking_work_rate ~", paste(columns, collapse = "+")))
+# Áp dụng LDA
+lda_model <- lda(formula, data = train_data)
+
+# In thông tin mô hình
+print(lda_model)
+
+```
+
+```{r}
+# Dự đoán trên tập kiểm tra
+pred <- predict(lda_model, test_data)
+
+# Đánh giá độ chính xác
+confusion_matrix_lda <- table(Predicted = pred$class, Actual = test_data$attacking_work_rate)
+accuracy <- sum(diag(confusion_matrix_lda)) / sum(confusion_matrix_lda)
+print(confusion_matrix_lda)
+eval_multi_class(confusion_matrix_lda)
+```
+
+#### QDA
+
+```{r}
+# Áp dụng QDA
+qda_model <- qda(attacking_work_rate~age+value+wage+height+weight+crossing + finishing + heading_accuracy + short_passing + volleys + dribbling + curve + fk_accuracy + long_passing + ball_control + acceleration + sprint_speed + agility + reactions + balance + shot_power + jumping + stamina + strength + long_shots + aggression + interceptions + positioning + vision + penalties + composure + marking + standing_tackle + sliding_tackle,
+ data = train_data)
+
+# In thông tin mô hình
+print(qda_model)
+
+```
+
+```{r}
+# Dự đoán trên tập kiểm tra
+pred_qda <- predict(qda_model, test_data)
+
+# Đánh giá độ chính xác
+confusion_matrix_qda <- table(Predicted = pred_qda$class, Actual = test_data$attacking_work_rate)
+accuracy_qda <- sum(diag(confusion_matrix_qda)) / sum(confusion_matrix_qda)
+print(confusion_matrix_qda)
+eval_multi_class(confusion_matrix_qda)
+```
+
+> **Nhận xét** - các mô hình LDA và QDA cho kết quả tương tự so với mô
+> hình hồi quy đa lớp. - Các mô hình phân loại hoạt động không thực sự
+> tốt đối với biến attacking_work_rate.Chúng ta có thể nói rằng các biến
+> không thực sự giải thích được attacking_work_rate
+
+## Phòng thủ
+
+### A/B Testing
+
+> -   Giả thuyết H0:các nhóm cầu thủ có cùng xu hướng di chuyển thì có
+>     trung bình overall như nhau.
+
+> -   Đối thuyết H1: Ít nhất có một nhóm có trung bình overall khác với
+>     những nhóm còn lại.
+
+```{r}
+set.seed(123)
+# Lựa chọn các cột cần thiết để tạo ra một data frame mới
+data_new_defensive <- data[, sapply(data, function(col) is.numeric(col) || is.factor(col))]
+glimpse(data_new_defensive)
+```
+
+```{r}
+data_new_defensive|>group_by(defensive_work_rate)|>
+  summarise(n=n(),mean=mean(overall))
+```
+
+```{r}
+ggplot(data_new_defensive, aes(x = defensive_work_rate, y = overall, fill = defensive_work_rate)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9)) +
+  labs(x = "Defensive Group", y = "Overall") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+data_def=data_new_defensive[sample(nrow(data), 10000), ]
+```
+
+```{r}
+set.seed(56)
+library(lmPerm)
+out_aov_1 <- aovp(formula = overall ~ defensive_work_rate, data = data_def, perm = "Prob")
+```
+
+```{r}
+summary(out_aov_1)
+```
+
+> **Nhận xét**
+>
+> -   p-value\<0.05 nên ta bác bỏ giả thuyết H0 và chấp nhận giả thuyết
+>     H1. Có ít nhất một nhóm có trung bình overall khác với các nhóm
+>     còn lại.
+
+```{r}
+#Vẽ biểu đồ cột
+defensive_work_rate_table=with(data_new_defensive,table(defensive_work_rate))
+barplot(
+  defensive_work_rate_table,
+  main = "Distribution of Defensive Work Rate", # Tiêu đề biểu đồ
+  xlab = "Defensive Work Rate",                  # Nhãn trục X
+  ylab = "Count",                     # Nhãn trục Y
+  col = rainbow(length(defensive_work_rate_table)), 
+  border = "white",                   
+  las = 2,                            
+  cex.names = 0.8,                    
+  cex.main = 1.5,                    
+  cex.lab = 1.2                       
+)
+```
+
+```{r}
+data_new_defensive=na.omit(data_new_defensive)
+```
+
+```{r}
+set.seed(123)
+# Áp dụng SMOTE
+data_new_defensive <- smotenc(
+  df = data_new_defensive,  # Dữ liệu ban đầu
+  var = "defensive_work_rate",  # Biến mục tiêu
+  k = 5,  
+  over_ratio = 1  # Tăng cường mẫu lớp thiểu số lên gấp đôi
+)
+```
+
+```{r}
+# Sử dụng table để xem phân phối các giá trị trong cột
+table(data_new_defensive$defensive_work_rate)
+
+```
+
+```{r}
+set.seed(42)
+train_index <- sample(1:nrow(data_new_defensive), size = 0.8 * nrow(data_new_defensive))
+
+train_data <- data_new_defensive[train_index, ]
+test_data <- data_new_defensive[-train_index, ]
+
+```
+
+```{r}
+columns <- c("age", "overall", "potential", "value", "wage", 
+                     "international_reputation", "skill_moves", 
+                     "body_type", "position", "height", 
+                    "weight", "crossing", "finishing", "heading_accuracy", "short_passing", 
+                    "volleys", "dribbling", "curve", "fk_accuracy", "long_passing", "ball_control", 
+                    "acceleration", "sprint_speed", "agility", "reactions", "balance", "shot_power", 
+                    "jumping", "stamina", "strength", "long_shots", "aggression", "interceptions", 
+                    "positioning", "vision", "penalties", "composure", "marking", "standing_tackle", 
+                    "sliding_tackle","release_clause")
+```
+
+### Hồi quy logistic đa lớp
+
+```{r}
+formula <- as.formula(paste("defensive_work_rate ~ ", paste(columns, collapse = "+")))
+logistic_model=multinom(formula,data=train_data,maxit=200)
+
+summary(logistic_model)
+```
+
+```{r}
+# Dự đoán lớp cho dữ liệu kiểm tra
+pred_class_defensive <- predict(logistic_model, newdata = test_data, type = "class")
+# Tạo confusion matrix
+conf_matrix_defensive <- table(test_data$defensive_work_rate, pred_class_defensive)
+conf_matrix_defensive
+
+```
+
+```{r}
+eval_multi_class(conf_matrix_defensive)
+```
+
+**Nhận xét** Mô hình hồi quy không thật sự tốt khi dự đoán các lớp. Để
+cải thiện chúng ta sẽ sử dụng mô hình khác như LDA và QDA.
+
+### LDA
+
+```{r}
+formula <- as.formula(paste("defensive_work_rate ~", paste(columns, collapse = "+")))
+# Áp dụng LDA
+lda_model <- lda(formula, data = train_data)
+
+# In thông tin mô hình
+print(lda_model)
+
+```
+
+```{r}
+# Dự đoán trên tập kiểm tra
+pred <- predict(lda_model, test_data)
+
+# Đánh giá độ chính xác
+confusion_matrix_lda <- table(Predicted = pred$class, Actual = test_data$defensive_work_rate)
+accuracy <- sum(diag(confusion_matrix_lda)) / sum(confusion_matrix_lda)
+print(confusion_matrix_lda)
+eval_multi_class(confusion_matrix_lda)
+```
+
+### QDA
+
+```{r}
+
+# Áp dụng QDA
+qda_model <- qda(defensive_work_rate~age+value+wage+height+weight+crossing + finishing + heading_accuracy + short_passing + volleys + dribbling + curve + fk_accuracy + long_passing + ball_control + acceleration + sprint_speed + agility + reactions + balance + shot_power + jumping + stamina + strength + long_shots + aggression + interceptions + positioning + vision + penalties + composure + marking + standing_tackle + sliding_tackle,
+ data = train_data)
+
+# In thông tin mô hình
+print(qda_model)
+
+```
+
+```{r}
+# Dự đoán trên tập kiểm tra
+pred_qda <- predict(qda_model, test_data)
+
+# Đánh giá độ chính xác
+confusion_matrix_qda <- table(Predicted = pred_qda$class, Actual = test_data$defensive_work_rate)
+accuracy_qda <- sum(diag(confusion_matrix_qda)) / sum(confusion_matrix_qda)
+print(confusion_matrix_qda)
+eval_multi_class(confusion_matrix_qda)
+```
+
+
+
+
+```
+
+
+
+
+
