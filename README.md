@@ -1,7 +1,7 @@
 # Exploratory Data Analysis on FIFA Data
 
 ## Introduction
-This project explores FIFA player data using statistical techniques and machine learning models in R. The analysis includes A/B testing, ANOVA, Logistic Regression, and Linear Regression to uncover insights into player attributes and performance.
+This project explores FIFA player data using statistical techniques (A/B Testing, ANOVA) and machine learning models in R.
 
 ## Dataset
 The dataset consists of various attributes related to FIFA players, including:
@@ -34,6 +34,12 @@ The following R libraries are used for analysis:
 ### Machine Learning Models
 - **Logistic Regression**: Classification tasks.Ex: reputation, position
 - **Linear Regression**: Predicting numerical values. Ex: potential, overall
+- Performed statistical evaluations to assess the reliability of the regression model, including:
+  - Checking the linearity of each feature
+  - Constructing confidence intervals for each coefficient
+  - Detecting outliers
+  - Testing for multicollinearity
+
 
 ## Results & Insights
 - Key findings from statistical tests
@@ -42,3 +48,8 @@ The following R libraries are used for analysis:
 
 ## Conclusion
 This project provides an in-depth analysis of FIFA data using statistical and machine learning techniques in R. The insights gained offer a deeper understanding of player performance and attributes.
+## Conclusion
+This project provides an in-depth analysis of FIFA data using statistical and machine learning techniques in R.  
+The insights gained offer a deeper understanding of player performance and attributes.
+
+📄 **View full report:** [REPORT.pdf](https://github.com/khoathai710/EDA-fifa-data/blob/master/REPORT.pdf)
