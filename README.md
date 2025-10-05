@@ -1,35 +1,40 @@
 # Exploratory Data Analysis on FIFA Data
 
-## Introduction
+## 1. Introduction
 This project explores FIFA player data using statistical techniques (A/B Testing, ANOVA) and machine learning models in R.
+<img width="864" height="486" alt="image" src="https://github.com/user-attachments/assets/58350b14-ab1c-48e8-8419-d62694a1686c" />
 
-## Dataset
-The dataset consists of various attributes related to FIFA players, including:
-- Player ratings
-- Positions
-- Physical attributes
-- Performance statistics
-
-## Tools & Libraries
+## 2. Tools & Libraries
 The following R libraries are used for analysis:
 - **tidyverse**: Data manipulation and visualization
 - **ggplot2**: Data visualization
 - **dplyr**: Data wrangling
 
-## Methodology
+## 3. Methodology
 
-### Data Cleaning & Preprocessing
-- Handling missing values
+### 3.1 Data Cleaning & Preprocessing
+- Handling missing values: In this case, missing values were kept as is, since they will later be handled using SMOTE during the model building phase.
 - Transforming categorical variables
+- Formatting numeric data: Cleaned and standardized numerical columns such as weight, height, and price by removing units (kg, $).
 
-### Exploratory Data Analysis (EDA)
-- Summary statistics
-- Data visualization
-- Correlation analysis
 
-### Statistical Analysis
-- A/B testing to compare groups
-- ANOVA to analyze variance between groups
+### 3.2 Exploratory Data Analysis (EDA)
+- Conducted distribution checks of the dataset — this step is crucial as it can affect the accuracy of statistical methods such as ANOVA and help identify potential outliers.
+<p align="center"> <img src="https://github.com/user-attachments/assets/5bf22726-dfe2-4ba6-9a93-dbeafbcaafdd" width="30%" /> <img src="https://github.com/user-attachments/assets/546ef878-6ee2-49be-8267-99e84d292887" width="30%" /> <img src="https://github.com/user-attachments/assets/218671eb-dd67-4636-b641-dd482b3eb46f" width="30%" /> </p>
+- Performed statistical analyses to evaluate players’ potential and market value based on their positions and age groups.
+<p align="center">
+   <img width="30%" alt="image" src="https://github.com/user-attachments/assets/a6fa945d-ea29-4460-b019-f55a53208167" />
+
+  <img width="30%" alt="image" src="https://github.com/user-attachments/assets/d9c1adc7-ebef-4c7f-bf34-34075bc86378" />
+
+  <img width="30%" alt="image" src="https://github.com/user-attachments/assets/6889d387-d18b-4f04-a21c-d009ed5a12c5" />
+
+</p>
+
+### 3.3 A/B Testing
+For the attribute position, the proposed hypotheses is testing:
+-  The average wage across different positions is equal; the overall rating, potential, and value of players do not differ significantly by position.
+=  A player’s position is related to their international reputation, attacking work rate, defensive work rate, and body type.
 
 ### Machine Learning Models
 - **Logistic Regression**: Classification tasks.Ex: reputation, position
