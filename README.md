@@ -30,12 +30,16 @@ The following R libraries are used for analysis:
   <img width="30%" alt="image" src="https://github.com/user-attachments/assets/6889d387-d18b-4f04-a21c-d009ed5a12c5" />
 
 </p>
+- Find potential players are not playing for famous football team -> help coach find a potential player with affordable price.
+<img width="606" height="270" alt="image" src="https://github.com/user-attachments/assets/8c3fc5b6-aad7-4bd5-9a32-67ffd5d37da8" />
 
 ### 3.3 A/B Testing
-For the attribute position, the proposed hypotheses is testing:
--  The average wage across different positions is equal; the overall rating, potential, and value of players do not differ significantly by position.
-=  A player’s position is related to their international reputation, attacking work rate, defensive work rate, and body type.
-
+- Using A/B tesing with Permutation ANOVA to find p-value:
+- We can set some purpose for analysis:
+  - Average wage, potential, overall of each value is different from each position (striker, deffender, midfelder)
+  - Position which players play at is affected your international reputation.
+  - To do hypothesis testing, first you can visualize to have a general picture
+  
 ### Machine Learning Models
 - **Logistic Regression**: Classification tasks.Ex: reputation, position
 - **Linear Regression**: Predicting numerical values. Ex: potential, overall
